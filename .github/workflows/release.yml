@@ -1,0 +1,22 @@
+name: Build and Release Plugin
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create plugin zip
+        run: |
+          mkdir -p release
+          zip -r release/chargeguard.zip . -x ".git/*" ".github/*"
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/chargeguard.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
