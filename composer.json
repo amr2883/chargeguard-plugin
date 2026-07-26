@@ -1,0 +1,13 @@
+{
+    "name": "chargeguard/woocommerce",
+    "description": "ChargeGuard for WooCommerce - Card Testing Prevention",
+    "type": "wordpress-plugin",
+    "license": "MIT",
+    "require": {
+        "stripe/stripe-php": "^13.0",
+        "yahnis-elsts/plugin-update-checker": "^5.5"
+    },
+    "autoload": {
+        "classmap": ["includes/"]
+    }
+}
