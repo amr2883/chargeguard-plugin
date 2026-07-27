@@ -1,4 +1,6 @@
 name: Build and Release Plugin ZIP
+permissions:
+  contents: write
 
 # يُشغَّل تلقائياً عند دفع أي تاج يبدأ بـ v (مثال: v1.0.14)، أو يدوياً من تبويب Actions
 on:
