@@ -52,11 +52,11 @@ class ChargeGuard_Stripe_Webhook {
             return new \WP_REST_Response(['status' => 'disabled'], 200);
         }
 
-        $stripe_init = __DIR__ . '/../vendor/stripe-php/init.php';
+        $stripe_init = __DIR__ . '/../vendor/stripe/stripe-php/init.php';
         if (file_exists($stripe_init)) {
             require_once $stripe_init;
         } else {
-            error_log('[ChargeGuard] Stripe webhook received but vendor/stripe-php/init.php is missing — run composer install.');
+            error_log('[ChargeGuard] Stripe webhook received but vendor/stripe/stripe-php/init.php is missing — run composer install.');
             return new \WP_REST_Response(['error' => 'Unable to process webhook'], 500);
         }
 

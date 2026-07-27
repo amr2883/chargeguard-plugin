@@ -53,6 +53,22 @@ jobs:
             --exclude='node_modules' \
             --exclude='build' \
             ./ build/chargeguard/
+      - name: Strip BOM from all PHP files (safety net)
+        working-directory: build/chargeguard
+        run: |
+          BOM_FOUND=0
+          while IFS= read -r -d '' f; do
+            if [ "$(head -c3 "$f" | od -An -tx1 | tr -d ' ')" = "efbbbf" ]; then
+              echo "BOM found and stripped: $f"
+              tail -c +4 "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
+              BOM_FOUND=1
+            fi
+          done < <(find . -name "*.php" -print0)
+          if [ "$BOM_FOUND" -eq 1 ]; then
+            echo "::warning::One or more PHP files had a BOM that was auto-stripped before packaging."
+          else
+            echo "No BOM found in any PHP file."
+          fi
 
       - name: Create ZIP using native Linux zip (forward-slash paths guaranteed)
         working-directory: build
