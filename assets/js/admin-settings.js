@@ -311,51 +311,33 @@
         if ($('#cg-managed-stores').length) loadStores();
     }
 
-    // ── Connect (device-code-style polling flow) ──────────────
-    let cgTurnstileToken = '';
-    window.cgTurnstileCallback = function(token) { cgTurnstileToken = token; };
+    // ── Connect (direct email + API key) ──────────────
+    $('#cg-connect-btn').on('click', function() {
+        const email  = $('#cg-email-input').val().trim();
+        const apiKey = $('#cg-api-key-input').val().trim();
+        const $btn   = $(this);
+        const $msg   = $('#cg-message');
 
-    const CG_POLL_INTERVAL_MS = 3000;
-    const CG_POLL_MAX_MS      = 16 * 60 * 1000; // slightly past backend's 15-min token expiry
-    let cgPollTimer  = null;
-    let cgPollStopAt = 0;
-
-    function cgShowPendingUI() {
-        $('#cg-connect-form').hide();
-        $('#cg-connect-pending').show();
-    }
-
-    function cgShowFormUI() {
-        $('#cg-connect-pending').hide();
-        $('#cg-connect-form').show();
-        $('#cg-step-1').removeClass('done').addClass('active');
-        $('#cg-step-2').removeClass('active done');
-    }
-
-    function cgStartPolling() {
-        cgPollStopAt = Date.now() + CG_POLL_MAX_MS;
-        cgShowPendingUI();
-        $('#cg-step-1').removeClass('active').addClass('done');
-        $('#cg-step-2').addClass('active');
-        clearTimeout(cgPollTimer);
-        cgPollOnce();
-    }
-
-    function cgPollOnce() {
-        if (Date.now() > cgPollStopAt) {
-            $('#cg-message').removeClass('success').addClass('error')
-                .text('This connection attempt timed out. Please try again.').show();
-            cgShowFormUI();
+        if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            $msg.removeClass('success').addClass('error').text('Please enter a valid email address.').show();
             return;
         }
 
-        $.post(ajaxurl, { action: 'chargeguard_connect_poll', nonce: nonce }, function(res) {
-            const status = res.data && res.data.status;
+        if (!apiKey) {
+            $msg.removeClass('success').addClass('error').text('Please enter your ChargeGuard API key.').show();
+            return;
+        }
 
-            if (status === 'active') {
-                $('#cg-step-2').removeClass('active').addClass('done');
-                $('#cg-step-3').addClass('active done');
-                const $msg = $('#cg-message');
+        $btn.prop('disabled', true).html('<span class="cg-spinner"></span> Connecting…');
+        $msg.hide().removeClass('error success');
+
+        $.post(ajaxurl, {
+            action:  'chargeguard_connect',
+            nonce:   nonces.connect,
+            email:   email,
+            api_key: apiKey,
+        }, function(res) {
+            if (res.success) {
                 if (res.data.selfTestOk === false) {
                     $msg.removeClass('success').addClass('error')
                         .text('⚠️ ' + (res.data.selfTestError || 'Connected, but signature verification failed.')).show();
@@ -363,67 +345,9 @@
                     $msg.removeClass('error').addClass('success')
                         .text('✅ Connected successfully! Reloading…').show();
                 }
-                setTimeout(() => location.reload(), 1500);
-                return;
-            }
-
-            if (status === 'expired') {
-                $('#cg-message').removeClass('success').addClass('error')
-                    .text('The confirmation link expired before it was clicked. Please try again.').show();
-                cgShowFormUI();
-                return;
-            }
-
-            if (status === 'failed') {
-                $('#cg-message').removeClass('success').addClass('error')
-                    .text((res.data && res.data.message) || 'Connection failed. Please try again.').show();
-                cgShowFormUI();
-                return;
-            }
-
-            // 'pending' — keep waiting
-            cgPollTimer = setTimeout(cgPollOnce, CG_POLL_INTERVAL_MS);
-        }).fail(function() {
-            // Network hiccup — keep polling rather than give up on one failure.
-            cgPollTimer = setTimeout(cgPollOnce, CG_POLL_INTERVAL_MS);
-        });
-    }
-
-    // A connect request was already in flight when this page loaded
-    // (e.g. the merchant refreshed while waiting for the email) —
-    // resume polling immediately instead of showing the form again.
-    if (chargeguardAdmin.hasPendingConnect) {
-        cgStartPolling();
-    }
-
-    $('#cg-connect-btn').on('click', function() {
-        const email = $('#cg-email-input').val().trim();
-        const $btn  = $(this);
-        const $msg  = $('#cg-message');
-
-        if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-            $msg.removeClass('success').addClass('error').text('Please enter a valid email address.').show();
-            return;
-        }
-
-        if (!cgTurnstileToken) {
-            $msg.removeClass('success').addClass('error').text('Please wait a moment for the security check to finish, then try again.').show();
-            return;
-        }
-
-        $btn.prop('disabled', true).html('<span class="cg-spinner"></span> Sending…');
-        $msg.hide().removeClass('error success');
-
-        $.post(ajaxurl, {
-            action:         'chargeguard_connect',
-            nonce:          nonces.connect,
-            email:          email,
-            turnstileToken: cgTurnstileToken,
-        }, function(res) {
-            if (res.success) {
-                cgStartPolling();
+                setTimeout(() => location.reload(), 1200);
             } else {
-                $msg.removeClass('success').addClass('error').text(res.data.message).show();
+                $msg.removeClass('success').addClass('error').text((res.data && res.data.message) || 'Connection failed. Please try again.').show();
                 $btn.prop('disabled', false).html('🔌 Connect ChargeGuard');
             }
         }).fail(function() {

@@ -661,6 +661,14 @@ class ChargeGuard_API_Client {
         $args = [
             'method'  => 'GET',
             'headers' => [
+                // Required even for this bodyless GET — see whitelist_get()
+                // for why (the backend's express.raw() body-capture
+                // middleware only runs, and thus only makes the signed
+                // empty-string body verifiable, when this header is set).
+                // BUG FIX: this header was previously missing here, causing
+                // every call to this method to fail HMAC verification on
+                // the backend (signed empty string vs. reconstructed '{}').
+                'Content-Type'            => 'application/json',
                 'X-API-Key'               => $this->api_key,
                 'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
                 'X-ChargeGuard-Signature' => $signature,
@@ -959,6 +967,9 @@ class ChargeGuard_API_Client {
         $args = [
             'method'  => 'GET',
             'headers' => [
+                // See whitelist_get() and the BUG FIX note in stores_get()
+                // above — this header was missing here too.
+                'Content-Type'            => 'application/json',
                 'X-API-Key'               => $this->api_key,
                 'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
                 'X-ChargeGuard-Signature' => $signature,
@@ -996,6 +1007,9 @@ class ChargeGuard_API_Client {
         $args = [
             'method'  => 'GET',
             'headers' => [
+                // See whitelist_get() and the BUG FIX note in stores_get()
+                // above — this header was missing here too.
+                'Content-Type'            => 'application/json',
                 'X-API-Key'               => $this->api_key,
                 'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
                 'X-ChargeGuard-Signature' => $signature,

@@ -390,9 +390,7 @@ class ChargeGuard_Admin_Settings {
         add_action('admin_notices', [$this, 'maybe_show_signing_self_test_notice']);
         add_action('admin_notices', [$this, 'maybe_show_secret_decrypt_notice']);
         add_action('admin_notices', [$this, 'maybe_show_key_derivation_notice']);
-        add_action('admin_notices', [$this, 'maybe_show_turnstile_notice']);
         add_action('wp_ajax_chargeguard_connect', [$this, 'ajax_connect']);
-        add_action('wp_ajax_chargeguard_connect_poll', [$this, 'ajax_connect_poll']);
         add_action('wp_ajax_chargeguard_disconnect', [$this, 'ajax_disconnect']);
         add_action('wp_ajax_chargeguard_verify_key',  [$this, 'ajax_verify_key']);
         add_action('wp_ajax_chargeguard_whitelist_get',    [$this, 'ajax_whitelist_get']);
@@ -523,7 +521,6 @@ class ChargeGuard_Admin_Settings {
             'currentIp'         => $current_admin_ip,
             'merchantId'        => get_option('chargeguard_merchant_id'),
             'isConnected'       => (bool) chargeguard_get_secret_option('chargeguard_api_key'),
-            'hasPendingConnect' => (bool) get_transient('chargeguard_pending_connect'),
         ]);
     }
 
@@ -747,39 +744,13 @@ class ChargeGuard_Admin_Settings {
         <?php
     }
 
-    /**
-     * Warn the merchant when the Cloudflare Turnstile site key powering the
-     * Connect flow's bot-verification widget is still Cloudflare's public
-     * "always passes" test key (1x00000000000000000000AA). With this key,
-     * the Turnstile widget renders and looks functional, but every
-     * challenge succeeds unconditionally — the Connect flow's first-line
-     * bot mitigation is silently a no-op. See CHARGEGUARD_TURNSTILE_SITE_KEY
-     * in the main plugin file.
-     *
-     * Silent the moment a real site key is defined.
-     */
-    public function maybe_show_turnstile_notice() {
-        if (!is_admin() || !current_user_can('manage_woocommerce')) {
-            return;
-        }
-        if (!defined('CHARGEGUARD_TURNSTILE_SITE_KEY') || CHARGEGUARD_TURNSTILE_SITE_KEY !== '1x00000000000000000000AA') {
-            return; // A real site key is configured — nothing to warn about.
-        }
-        ?>
-        <div class="notice notice-warning is-dismissible">
-            <p>
-                <strong>ChargeGuard:</strong>
-                <?php esc_html_e('The Connect flow is currently using Cloudflare\'s public Turnstile TEST key, which always passes regardless of whether the visitor is a human or a bot — bot protection on the Connect request is not active. To fix this, add your real Turnstile site key to wp-config.php (above the "That\'s all, stop editing!" comment): define(\'CHARGEGUARD_TURNSTILE_SITE_KEY\', \'your_real_site_key_here\'); This notice will disappear automatically once a real key is set.', 'chargeguard-woocommerce'); ?>
-            </p>
-        </div>
-        <?php
-    }
+    
 
     public function ajax_connect() {
-        // Own nonce action — initiating a connect request emails an
-        // address and starts binding this store to a ChargeGuard
-        // account; a nonce that only authorizes read-only status
-        // checks must not also authorize this.
+        // Own nonce action — unchanged: connecting a store is the same
+        // sensitive, account-binding action it always was, regardless of
+        // which credential proves it (an emailed link previously; a
+        // directly-entered API key now).
         check_ajax_referer('chargeguard_connect_action_nonce', 'nonce');
 
         if (!current_user_can('manage_woocommerce')) {
@@ -791,68 +762,48 @@ class ChargeGuard_Admin_Settings {
             wp_send_json_error(['message' => 'Please enter a valid email address.']);
         }
 
-        // L2 fix: lightweight per-user transient throttle, matching the
-        // pattern already used in ajax_check_fingerprint() (1 request per
-        // window via get_transient()/set_transient()). This does not
-        // replace the backend's own 15-minute-attempt rate limit — it
-        // exists purely to stop a single WordPress request cycle (e.g. a
-        // compromised Shop Manager account, or a script replaying a
-        // captured nonce) from firing the confirmation email endpoint in
-        // rapid succession before the backend's own limiter is ever
-        // reached. Keyed on the current user ID rather than IP, since
-        // this action already requires an authenticated manage_woocommerce
-        // session — the user ID is the more precise identity for this
-        // action's own throttle.
+        $api_key = trim(sanitize_text_field(wp_unslash($_POST['api_key'] ?? '')));
+        if (!$api_key) {
+            wp_send_json_error(['message' => 'Please enter your ChargeGuard API key.']);
+        }
+        // Basic sanity check before spending a network round trip on
+        // obviously-invalid input — mirrors the length-only sanity checks
+        // already used for Stripe/PayPal secrets elsewhere in this file
+        // (real validation always happens server-side, on the backend).
+        if (strlen($api_key) < 20) {
+            wp_send_json_error(['message' => 'That does not look like a valid API key. Please copy it again from your ChargeGuard welcome email.']);
+        }
+
+        // Same lightweight per-user throttle as before — independent of,
+        // and in addition to, the backend's own per-IP connectRateLimit.
         $connect_rl_key = 'cg_connect_rl_' . get_current_user_id();
         if (get_transient($connect_rl_key)) {
             wp_send_json_error(['message' => 'Please wait a moment before trying again.']);
         }
         set_transient($connect_rl_key, 1, 30);
 
-        // The backend's /connect requires a Cloudflare Turnstile token
-        // proving this request originated from a real browser. This PHP
-        // handler runs server-to-server and cannot solve that challenge
-        // itself — the token is produced by the Turnstile widget rendered
-        // on this settings page (see settings_page()) and relayed here by
-        // the browser, exactly like the email address is.
-        // SECURITY BOUNDARY NOTE (informational finding, pre-launch audit):
-        // The check below confirms the token is PRESENT, not that it is VALID.
-        // This plugin cannot verify Turnstile tokens itself, and must not try to —
-        // that would require the Turnstile *secret* key, which must never be
-        // configured on, stored in, or exposed to WordPress/PHP. WordPress
-        // (plugins, DB backups, hosting-panel access, etc.) is a wider and less
-        // controlled trust boundary than the ChargeGuard backend, so secret
-        // material that gates a security decision stays server-side only —
-        // the same principle already applied to chargeguard_api_signing_secret
-        // and CHARGEGUARD_ENCRYPTION_KEY elsewhere in this file.
-        //
-        // Real verification is the responsibility of the ChargeGuard backend's
-        // POST /api/auth/connect handler, which MUST, on every request:
-        //   1. Call https://challenges.cloudflare.com/turnstile/v0/siteverify
-        //      with this token and the Turnstile secret key.
-        //   2. Check that the response's `success` field is true (and ideally
-        //      that `hostname`/`action` match expectations).
-        //   3. Reject the connect request (do not issue a connectRequestId) if
-        //      verification fails.
-        // If the backend does not do this, Turnstile here provides no real bot
-        // mitigation — it becomes a cosmetic checkbox with no security value.
-        $turnstile_token = sanitize_text_field(wp_unslash($_POST['turnstileToken'] ?? ''));
-        if (!$turnstile_token) {
-            wp_send_json_error(['message' => 'Security check not completed. Please refresh the page and try again.']);
-        }
-
         $site_url = get_site_url();
 
-        $response = wp_remote_post('https://chargeguard-api.onrender.com/api/auth/connect', [
+        // TRUST MODEL NOTE: the API key itself IS the proof of ownership
+        // here — a 256-bit secret only ever delivered once, by email,
+        // after the merchant verified their address on the Landing Page.
+        // That is at least as strong a credential as clicking a
+        // confirmation link (the old flow's proof), so no bot-check is
+        // needed on this request: unlike the old email-based /connect
+        // endpoint (which sends an email to an address the caller merely
+        // typed, and therefore needs Turnstile to prevent mass email
+        // abuse), this call can only ever succeed against a key the
+        // caller already possesses — there is nothing here for a bot to
+        // gain by hammering it.
+        $response = wp_remote_post('https://chargeguard-api.onrender.com/api/auth/connect-with-key', [
             'timeout' => 15,
             'headers' => [
                 'Content-Type'   => 'application/json',
+                'X-API-Key'      => $api_key,
                 'x-store-domain' => wp_parse_url( home_url(), PHP_URL_HOST ),
             ],
             'body'    => json_encode([
-                'email'          => $email,
-                'siteUrl'        => $site_url,
-                'turnstileToken' => $turnstile_token,
+                'siteUrl' => $site_url,
             ]),
         ]);
 
@@ -867,108 +818,34 @@ class ChargeGuard_Admin_Settings {
             wp_send_json_error(['message' => $body['error'] ?? 'Too many attempts. Please wait before trying again.']);
         }
 
-        if ($code !== 200 || empty($body['connectRequestId']) || !is_string($body['connectRequestId'])) {
-            error_log('ChargeGuard: /auth/connect returned HTTP ' . $code . ' with an unexpected body. Keys present: ' . (is_array($body) ? implode(', ', array_keys($body)) : 'none (body was not valid JSON)'));
+        if ($code === 401) {
+            wp_send_json_error(['message' => 'Invalid API key. Please check the key from your ChargeGuard welcome email and try again.']);
+        }
+
+        if ($code === 403 && ($body['code'] ?? '') === 'EMAIL_NOT_VERIFIED') {
+            wp_send_json_error(['message' => 'Please verify your email at chargeguard.io before connecting your store.']);
+        }
+
+        if ($code !== 200 || empty($body['merchantId']) || empty($body['webhookSecret'])) {
+            error_log('ChargeGuard: /auth/connect-with-key returned HTTP ' . $code . ' with an unexpected body. Keys present: ' . (is_array($body) ? implode(', ', array_keys($body)) : 'none (body was not valid JSON)'));
             wp_send_json_error(['message' => 'Connection failed. Please try again.']);
         }
 
-        // Pending — not yet confirmed. Stored as a transient, not an
-        // option, so it naturally expires and vanishes if the merchant
-        // never clicks the email link, tracking the backend's own
-        // 15-minute connect-token window with a small buffer. This also
-        // lets settings_page() detect and resume an in-flight request
-        // across a browser refresh instead of losing all state.
-        //
-        set_transient('chargeguard_pending_connect', [
-            'request_id' => $body['connectRequestId'],
-            'email'      => $email,
-            'issued_at'  => time(),
-        ], 20 * MINUTE_IN_SECONDS);
-
-        wp_send_json_success([
-            'status'           => 'pending',
-            'connectRequestId' => $body['connectRequestId'],
-            'email'            => $email,
-        ]);
-    }
-
-    /**
-     * Polled by the browser (see settings_page() JS) while waiting for
-     * the merchant to click the confirmation link in their email. Mirrors
-     * OAuth 2.0 Device Authorization Grant (RFC 8628) polling semantics
-     * on the client side, matching /connect/status's design on the
-     * backend.
-     */
-    public function ajax_connect_poll() {
-        check_ajax_referer('chargeguard_connect_nonce', 'nonce');
-
-        if (!current_user_can('manage_woocommerce')) {
-            wp_send_json_error(['message' => 'Unauthorized'], 403);
-        }
-
-        $pending = get_transient('chargeguard_pending_connect');
-        if (!$pending || empty($pending['request_id'])) {
-            wp_send_json_error(['status' => 'expired', 'message' => 'No pending connection request found. Please start again.']);
-        }
-
-        $response = wp_remote_get(
-            'https://chargeguard-api.onrender.com/api/auth/connect/status?requestId=' . urlencode($pending['request_id']),
-            ['timeout' => 10]
-        );
-
-        if (is_wp_error($response)) {
-            // Transient network hiccup — keep polling rather than fail
-            // the merchant's connection attempt on one bad check.
-            wp_send_json_success(['status' => 'pending']);
-        }
-
-        $body   = json_decode(wp_remote_retrieve_body($response), true);
-        $status = $body['status'] ?? 'pending';
-
-        if ($status === 'expired') {
-            delete_transient('chargeguard_pending_connect');
-            wp_send_json_success(['status' => 'expired']);
-        }
-
-        if ($status !== 'active') {
-            wp_send_json_success(['status' => 'pending']);
-        }
-
-        $required_keys = ['apiKey', 'merchantId', 'webhookSecret'];
-        $is_valid_body = is_array($body);
-        if ($is_valid_body) {
-            foreach ($required_keys as $key) {
-                if (empty($body[$key]) || !is_string($body[$key])) {
-                    $is_valid_body = false;
-                    break;
-                }
-            }
-        }
-
-        if (!$is_valid_body) {
-            error_log('ChargeGuard: /auth/connect/status returned status=active with an invalid or incomplete body. Keys present: ' . (is_array($body) ? implode(', ', array_keys($body)) : 'none (body was not valid JSON)'));
-            delete_transient('chargeguard_pending_connect');
-            wp_send_json_error(['status' => 'failed', 'message' => 'An unexpected error occurred while connecting to ChargeGuard. Please try again.']);
-        }
-
-        chargeguard_update_secret_option('chargeguard_api_key', sanitize_text_field($body['apiKey']));
-        update_option('chargeguard_merchant_id',    sanitize_text_field($body['merchantId']));
+        chargeguard_update_secret_option('chargeguard_api_key', $api_key);
+        update_option('chargeguard_merchant_id', sanitize_text_field($body['merchantId']));
         chargeguard_update_secret_option('chargeguard_webhook_secret', sanitize_text_field($body['webhookSecret']));
-        update_option('chargeguard_connected_email', sanitize_email($pending['email']));
+        // The backend's authoritative tenant.email is stored for display —
+        // not the value the merchant typed — so the UI can never show a
+        // mismatched email even on a typo; the key alone determined which
+        // account was actually connected.
+        update_option('chargeguard_connected_email', sanitize_email($body['email'] ?? $email));
 
-        // No separate api_signing_secret — the backend was never built to
-        // accept or confirm one, so signing uses webhookSecret exclusively
-        // (see class-api-client.php generate_hmac()). This delete is
-        // defensive cleanup for any install that still has a leftover
-        // value from before this cleanup.
         delete_option('chargeguard_api_signing_secret');
 
         $this->register_woocommerce_webhook($body['webhookSecret']);
 
         $self_test_client = new ChargeGuard_API_Client();
         $self_test_result = $self_test_client->self_test();
-
-        delete_transient('chargeguard_pending_connect');
 
         if (is_wp_error($self_test_result)) {
             update_option('chargeguard_signing_self_test', [
@@ -979,7 +856,7 @@ class ChargeGuard_Admin_Settings {
             error_log('ChargeGuard: post-connect signing self-test failed: ' . $self_test_result->get_error_message());
             wp_send_json_success([
                 'status'        => 'active',
-                'email'         => $pending['email'],
+                'email'         => $body['email'] ?? $email,
                 'selfTestOk'    => false,
                 'selfTestError' => __('Connected, but ChargeGuard could not verify request signing. Fraud protection may not be active — check the notice at the top of this page.', 'chargeguard-woocommerce'),
             ]);
@@ -987,8 +864,10 @@ class ChargeGuard_Admin_Settings {
 
         update_option('chargeguard_signing_self_test', ['status' => 'ok', 'time' => time()]);
 
-        wp_send_json_success(['status' => 'active', 'email' => $pending['email'], 'selfTestOk' => true]);
+        wp_send_json_success(['status' => 'active', 'email' => $body['email'] ?? $email, 'selfTestOk' => true]);
     }
+
+    
 
     public function ajax_disconnect() {
         // Own nonce action — disconnects the store's fraud protection
@@ -1562,7 +1441,7 @@ class ChargeGuard_Admin_Settings {
             wp_send_json_error( [ 'message' => 'Please save your Stripe secret key first.' ] );
         }
 
-        $stripe_init = __DIR__ . '/../vendor/stripe/stripe-php/init.php';
+        $stripe_init = __DIR__ . '/../vendor/stripe-php/init.php';
         if ( ! file_exists( $stripe_init ) ) {
             wp_send_json_error( [ 'message' => 'Stripe SDK not installed. Run composer install.' ] );
         }
@@ -1627,12 +1506,6 @@ class ChargeGuard_Admin_Settings {
         $block_duration      = get_option( 'chargeguard_firewall_block_duration', 24 );
         $trust_proxy_headers = get_option( 'chargeguard_trust_proxy_headers', 0 );
 
-        // A prior POST /connect may still be awaiting email confirmation
-        // (e.g. the merchant refreshed this page while waiting). Detecting
-        // this here lets the UI resume polling immediately instead of
-        // showing the entry form again and losing the merchant's place.
-        $pending_connect = get_transient('chargeguard_pending_connect');
-
         // All nonces used by this page's JS are localized via
         // enqueue_admin_assets() -> wp_localize_script('chargeguardAdmin', ...).
         // This method does not create or output any nonce of its own.
@@ -1693,26 +1566,19 @@ class ChargeGuard_Admin_Settings {
         <?php else: ?>
 
             <!-- 🔌 Connect State -->
-            <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
             <div class="cg-card">
                 <div class="cg-status-badge disconnected">
                     <div class="cg-dot gray"></div>
                     Not Connected
                 </div>
 
-                <div class="cg-steps">
-                    <div class="cg-step <?php echo $pending_connect ? 'done' : 'active'; ?>" id="cg-step-1">① Enter Email</div>
-                    <div class="cg-step <?php echo $pending_connect ? 'active' : ''; ?>" id="cg-step-2">② Confirm Email</div>
-                    <div class="cg-step" id="cg-step-3">③ Protected</div>
-                </div>
-
-                <div id="cg-connect-form" <?php echo $pending_connect ? 'style="display:none;"' : ''; ?>>
+                <div id="cg-connect-form">
                     <p style="color:#555;font-size:14px;margin-bottom:16px;">
-                        Enter the email you used to register at ChargeGuard. We'll send a confirmation link — click it, then this page finishes connecting automatically.
+                        <?php esc_html_e('Enter the email and API key you received after signing up and verifying your email at chargeguard.io.', 'chargeguard-woocommerce'); ?>
                     </p>
 
                     <label style="font-size:13px;font-weight:600;color:#333;">
-                        Your ChargeGuard Email
+                        <?php esc_html_e('Your ChargeGuard Email', 'chargeguard-woocommerce'); ?>
                     </label>
                     <input
                         type="email"
@@ -1720,25 +1586,22 @@ class ChargeGuard_Admin_Settings {
                         class="cg-input"
                         placeholder="you@yourstore.com"
                         autocomplete="email"
-                        value="<?php echo esc_attr($pending_connect['email'] ?? ''); ?>"
                     />
 
-                    <div class="cf-turnstile" id="cg-turnstile-widget"
-                         data-sitekey="<?php echo esc_attr( defined('CHARGEGUARD_TURNSTILE_SITE_KEY') ? CHARGEGUARD_TURNSTILE_SITE_KEY : '' ); ?>"
-                         data-callback="cgTurnstileCallback"
-                         style="margin-top:14px;"></div>
+                    <label style="font-size:13px;font-weight:600;color:#333;margin-top:12px;display:block;">
+                        <?php esc_html_e('Your ChargeGuard API Key', 'chargeguard-woocommerce'); ?>
+                    </label>
+                    <input
+                        type="password"
+                        id="cg-api-key-input"
+                        class="cg-input"
+                        placeholder="cg_live_..."
+                        autocomplete="off"
+                    />
 
-                    <button class="cg-btn cg-btn-primary" id="cg-connect-btn">
-                        🔌 Connect ChargeGuard
+                    <button class="cg-btn cg-btn-primary" id="cg-connect-btn" style="margin-top:16px;">
+                        🔌 <?php esc_html_e('Connect ChargeGuard', 'chargeguard-woocommerce'); ?>
                     </button>
-                </div>
-
-                <div id="cg-connect-pending" <?php echo $pending_connect ? '' : 'style="display:none;"'; ?> style="text-align:center;padding:12px 0;">
-                    <div class="cg-spinner" style="border-top-color:#f97316;border-color:#fed7aa;width:22px;height:22px;margin:0 auto 14px;"></div>
-                    <p style="color:#555;font-size:14px;margin-bottom:4px;">
-                        Check your inbox<?php echo $pending_connect ? ' (' . esc_html($pending_connect['email']) . ')' : ''; ?> and click the confirmation link.
-                    </p>
-                    <p style="color:#94a3b8;font-size:12px;">This page will finish connecting automatically once you confirm. The link expires in 15 minutes.</p>
                 </div>
 
                 <div class="cg-message" id="cg-message"></div>
