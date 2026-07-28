@@ -254,16 +254,39 @@ class ChargeGuard_Secret_Crypto {
  * correctly on read, and is opportunistically re-saved encrypted at
  * that point — no separate upgrade routine needed.
  */
+/**
+ * Per-request read cache for chargeguard_get_secret_option(), shared with
+ * chargeguard_update_secret_option() so a write can invalidate/refresh it.
+ */
+class ChargeGuard_Secret_Option_Cache {
+    private static $values = [];
+
+    public static function has($name) {
+        return array_key_exists($name, self::$values);
+    }
+
+    public static function get($name) {
+        return self::$values[$name] ?? null;
+    }
+
+    public static function set($name, $value) {
+        self::$values[$name] = $value;
+    }
+
+    public static function forget($name) {
+        unset(self::$values[$name]);
+    }
+}
+
 function chargeguard_get_secret_option($name, $default = '') {
-    static $cache = [];
-    if (array_key_exists($name, $cache)) {
-        return $cache[$name];
+    if (ChargeGuard_Secret_Option_Cache::has($name)) {
+        return ChargeGuard_Secret_Option_Cache::get($name);
     }
 
     $stored = get_option($name, $default);
 
     if (!is_string($stored) || $stored === '') {
-        $cache[$name] = $stored;
+        ChargeGuard_Secret_Option_Cache::set($name, $stored);
         return $stored;
     }
 
@@ -272,24 +295,20 @@ function chargeguard_get_secret_option($name, $default = '') {
         $plaintext = ChargeGuard_Secret_Crypto::decrypt($stored, $migrated);
         if ($plaintext === false) {
             chargeguard_flag_secret_decrypt_failure($name);
-            $cache[$name] = '';
+            ChargeGuard_Secret_Option_Cache::set($name, '');
             return '';
         }
         chargeguard_clear_secret_decrypt_failure($name);
         if ($migrated) {
-            // Was still encrypted under the legacy wp_salt('auth')-derived
-            // key; re-save under the current (CHARGEGUARD_ENCRYPTION_KEY)
-            // key now that we've proven we can read it.
             chargeguard_update_secret_option($name, $plaintext);
-            error_log('[ChargeGuard] Migrated option ' . $name . ' from wp_salt-derived key to CHARGEGUARD_ENCRYPTION_KEY.');
+            error_log('[ChargeGuard] Migrated option ' . $name . ' from legacy key to CHARGEGUARD_ENCRYPTION_KEY.');
         }
-        $cache[$name] = $plaintext;
+        ChargeGuard_Secret_Option_Cache::set($name, $plaintext);
         return $plaintext;
     }
 
-    // Legacy plaintext — self-heal in place; still return plaintext now.
     chargeguard_update_secret_option($name, $stored);
-    $cache[$name] = $stored;
+    ChargeGuard_Secret_Option_Cache::set($name, $stored);
     return $stored;
 }
 
@@ -354,14 +373,19 @@ function chargeguard_clear_secret_decrypt_failure($name) {
 
 function chargeguard_update_secret_option($name, $value) {
     if (!is_string($value) || $value === '') {
-        return update_option($name, $value);
+        $result = update_option($name, $value);
+        ChargeGuard_Secret_Option_Cache::set($name, $value);
+        return $result;
     }
     $encrypted = ChargeGuard_Secret_Crypto::encrypt($value);
     if ($encrypted === false) {
-        error_log('[ChargeGuard] Failed to encrypt option ' . $name . ' — refusing to store plaintext.');
+        error_log('[ChargeGuard] Failed to encrypt option ' . $name . ' - refusing to store plaintext.');
+        ChargeGuard_Secret_Option_Cache::forget($name);
         return false;
     }
-    return update_option($name, $encrypted);
+    $result = update_option($name, $encrypted);
+    ChargeGuard_Secret_Option_Cache::set($name, $value);
+    return $result;
 }
 
 class ChargeGuard_Admin_Settings {
