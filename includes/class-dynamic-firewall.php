@@ -860,6 +860,45 @@ class ChargeGuard_Dynamic_Firewall {
     /**
      * إيقاف عرض الصفحة مع رسالة شفافة.
      */
+    /**
+     * Marks a Blocks-checkout order that ChargeGuard is blocking as
+     * 'cancelled' and records why, instead of leaving it in
+     * 'checkout-draft' status. Without this, a blocked attempt's order is
+     * indistinguishable from an ordinary abandoned checkout draft, and
+     * chargeguard_cleanup_stale_drafts() (chargeguard-woocommerce.php)
+     * permanently hard-deletes it a couple hours later — destroying the
+     * only record that a block ever happened.
+     *
+     * Also fills a logging gap discovered during a live-traffic audit:
+     * unlike intercept_checkout() (classic checkout), this Blocks-checkout
+     * path previously had no local error_log() call on a block decision,
+     * making it impossible to reconcile which orders were blocked after
+     * their draft was cleaned up. This method now logs explicitly.
+     *
+     * It is the status change itself (away from 'checkout-draft') that
+     * protects the order from chargeguard_cleanup_stale_drafts(), since
+     * that routine's query only ever matches status = checkout-draft. The
+     * meta exists purely for the admin/forensic trail (which device,
+     * which reason, when).
+     *
+     * @param WC_Order $order
+     * @param string   $reason Machine-readable reason, e.g. 'local_blacklist',
+     *                         'api_block', 'api_unavailable_local_blacklist',
+     *                         'api_unavailable_rate_limited'.
+     */
+    private function mark_order_blocked($order, $reason) {
+        $order->update_meta_data('_chargeguard_block_reason', $reason);
+        $order->update_meta_data('_chargeguard_blocked_at', time());
+        $order->save_meta_data();
+
+        $order->update_status(
+            'cg-blocked',
+            __('Blocked by ChargeGuard: ', 'chargeguard-woocommerce') . $reason
+        );
+
+        error_log('ChargeGuard: order #' . $order->get_id() . ' blocked (cg-blocked) — reason: ' . $reason);
+    }
+
     private function block_access($fingerprint = '') {
         if ($fingerprint !== '') {
             $this->report_blacklist_block($fingerprint);
@@ -974,6 +1013,7 @@ class ChargeGuard_Dynamic_Firewall {
             $local_blacklist = get_option($this->blacklist_option, []);
             if (is_array($local_blacklist) && isset($local_blacklist[$device_fp]) && $local_blacklist[$device_fp] > time()) {
                 $this->report_blacklist_block($device_fp);
+                $this->mark_order_blocked($order, 'local_blacklist');
 
                 $message = __('Sorry, your order cannot be processed.', 'chargeguard-woocommerce');
 
@@ -1058,6 +1098,7 @@ class ChargeGuard_Dynamic_Firewall {
                 if ($fallback['local_block_type']) {
                     $this->report_api_down_block($device_fp, $ip, $fallback['local_block_type']);
                 }
+                $this->mark_order_blocked($order, $fallback['reason']);
 
                 $message = __('Sorry, your order cannot be processed at this time. Please try again shortly.', 'chargeguard-woocommerce');
 
@@ -1100,6 +1141,7 @@ class ChargeGuard_Dynamic_Firewall {
             if (!empty($device_fp) && $device_fp !== 'unknown') {
                 do_action('chargeguard_mark_device_fraud', $device_fp, 'chargeguard_api_block');
             }
+            $this->mark_order_blocked($order, $blocked_reason ?: 'api_block');
 
             $message = __('Sorry, your order cannot be processed.', 'chargeguard-woocommerce');
 

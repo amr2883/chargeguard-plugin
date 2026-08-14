@@ -14,7 +14,7 @@ defined('ABSPATH') || exit;
 /**
  * Single source of truth for the plugin's version, read directly from
  * the header comment above so it can never drift out of sync with the
- * `Version:` line. Used to cache-bust every enqueued script/style â€”
+ * `Version:` line. Used to cache-bust every enqueued script/style ├تظéشظإ
  * bumping the header version alone is enough to invalidate cached
  * assets on the next release, with no separate literal to remember to
  * update. Mirrors WordPress core's own convention (WP_VERSION,
@@ -29,7 +29,7 @@ if (!defined('CHARGEGUARD_VERSION')) {
 // Turnstile removed (2024 review): the plugin's Connect flow now
 // authenticates via a directly-entered API key (see
 // ChargeGuard_Admin_Settings::ajax_connect()), which is proof-of-possession
-// on its own — bot mitigation via Turnstile has no security value here.
+// on its own ظ¤ bot mitigation via Turnstile has no security value here.
 // Turnstile is still enforced server-side on the backend's email-based
 // /api/auth/connect endpoint (unused by this plugin now, kept for
 // possible future "forgot my key" recovery flows), so no security
@@ -42,7 +42,7 @@ if (!defined('CHARGEGUARD_VERSION')) {
  * the database on hosts that never hardcode AUTH_KEY/AUTH_SALT in
  * wp-config.php. See ChargeGuard_Secret_Crypto::get_key().
  *
- * ChargeGuard never defines this itself â€” it must be set by the
+ * ChargeGuard never defines this itself ├تظéشظإ it must be set by the
  * merchant/host as a 64-character random hex string, e.g. via:
  *   define('CHARGEGUARD_ENCRYPTION_KEY', 'REPLACE_WITH_64_HEX_CHARS');
  * in wp-config.php (above "That's all, stop editing!"), or by exporting
@@ -57,15 +57,16 @@ require_once __DIR__ . '/includes/class-stripe-webhook.php';
 require_once __DIR__ . '/includes/class-paypal-webhook.php';
 require_once __DIR__ . '/includes/class-trusted-proxy.php';
 require_once __DIR__ . '/includes/class-dynamic-firewall.php';
+require_once __DIR__ . '/includes/class-order-status.php';
 
 require_once __DIR__ . '/includes/class-privacy.php';
 require_once __DIR__ . '/includes/class-plugin-updater.php';
 
 /**
  * Declare compatibility with WooCommerce's High-Performance Order Storage
- * (custom order tables). Must run on before_woocommerce_init â€” the hook
+ * (custom order tables). Must run on before_woocommerce_init ├تظéشظإ the hook
  * WooCommerce itself fires specifically for this declaration, ahead of
- * plugins_loaded (where chargeguard_init() runs) â€” so this registration
+ * plugins_loaded (where chargeguard_init() runs) ├تظéشظإ so this registration
  * is intentionally separate from and earlier than the rest of this file's
  * bootstrap logic.
  */
@@ -75,12 +76,12 @@ add_action('before_woocommerce_init', function () {
     }
 });
 
-// chargeguard_add_device_fingerprint_to_order() removed — its sole
+// chargeguard_add_device_fingerprint_to_order() removed ظ¤ its sole
 // purpose was writing the now-deprecated `_chargeguard_device_fingerprint`
 // meta key on woocommerce_checkout_create_order. That hook only fires for
 // classic checkout (Blocks/Store API checkout builds its order via a
 // separate code path and doesn't reliably fire it), which meant this
-// function silently never ran for Blocks-checkout orders — exactly the
+// function silently never ran for Blocks-checkout orders ظ¤ exactly the
 // kind of two-key drift this unification removes. `_chargeguard_device_fp`
 // (written by ChargeGuard_Dynamic_Firewall::intercept_checkout_block() and
 // reconcile_pre_order_id()) already covers both checkout flows and is now
@@ -98,7 +99,7 @@ if (!function_exists('chargeguard_add_fingerprint_to_webhook_payload')) {
         }
 
         if ($resource === 'order' && isset($payload['id'])) {
-            // Canonical accessor — see ChargeGuard_Dynamic_Firewall::get_order_device_fp()
+            // Canonical accessor ظ¤ see ChargeGuard_Dynamic_Firewall::get_order_device_fp()
             // for the read-both (canonical + legacy), write-one rationale.
             // This also fixes a live bug: Blocks-checkout orders never had
             // the old `_chargeguard_device_fingerprint` key populated at
@@ -111,14 +112,14 @@ if (!function_exists('chargeguard_add_fingerprint_to_webhook_payload')) {
 
             // Server-signed device token (see maybe_issue_device_token() /
             // ChargeGuard_Dynamic_Firewall::get_order_device_token()). This
-            // is a NEW top-level field — `_chargeguard_device_token` is a
+            // is a NEW top-level field ظ¤ `_chargeguard_device_token` is a
             // private (underscore-prefixed) meta key, which WooCommerce's
             // webhook payload serializer excludes from `meta_data` by
             // default, so the backend's meta_data fallback lookup in
             // /woocommerce-webhook could never find it. Injecting it
             // explicitly here is the only way to get it into the payload.
             // Omitted entirely (never sent as null/empty) for orders with
-            // no token — pre-device-token-feature orders, older plugin
+            // no token ظ¤ pre-device-token-feature orders, older plugin
             // versions, or a visitor for whom maybe_issue_device_token()
             // never successfully minted one; the backend already treats a
             // missing deviceToken as 'unsigned', identical to today's
@@ -160,14 +161,14 @@ function chargeguard_maybe_show_deactivated_notice() {
     }
     $connected = get_option('chargeguard_api_key');
     if (!$connected) {
-        // Store was never connected â€” nothing is still transmitting, no need to warn.
+        // Store was never connected ├تظéشظإ nothing is still transmitting, no need to warn.
         delete_transient('chargeguard_deactivated_notice');
         return;
     }
     ?>
     <div class="notice notice-warning is-dismissible">
         <p>
-            <strong>ChargeGuard has been deactivated</strong> â€” but your store's
+            <strong>ChargeGuard has been deactivated</strong> ├تظéشظإ but your store's
             ChargeGuard webhook and settings are still saved and the webhook
             will continue sending order data to ChargeGuard until you either
             reactivate the plugin or remove it completely.
@@ -197,17 +198,18 @@ function chargeguard_init() {
     new ChargeGuard_Stripe_Webhook();
 new ChargeGuard_PayPal_Webhook();
     new ChargeGuard_Dynamic_Firewall();
+    new ChargeGuard_Order_Status();
     
     new ChargeGuard_Privacy();
     // Device-fingerprint order meta is now written solely by
     // ChargeGuard_Dynamic_Firewall (intercept_checkout_block() /
     // reconcile_pre_order_id()) under the single canonical key
-    // `_chargeguard_device_fp` — no separate hook needed here anymore.
+    // `_chargeguard_device_fp` ظ¤ no separate hook needed here anymore.
     add_filter('woocommerce_webhook_payload', 'chargeguard_add_fingerprint_to_webhook_payload', 10, 4);
 }
 
 // Daily refresh of Cloudflare's published IP ranges, entirely off the
-// checkout request path — see ChargeGuard_Trusted_Proxy::refresh_cf_ranges().
+// checkout request path ظ¤ see ChargeGuard_Trusted_Proxy::refresh_cf_ranges().
 add_action('chargeguard_refresh_cf_ranges', ['ChargeGuard_Trusted_Proxy', 'refresh_cf_ranges']);
 register_activation_hook(__FILE__, function () {
     if (!wp_next_scheduled('chargeguard_refresh_cf_ranges')) {
@@ -216,6 +218,67 @@ register_activation_hook(__FILE__, function () {
 });
 register_deactivation_hook(__FILE__, function () {
     wp_clear_scheduled_hook('chargeguard_refresh_cf_ranges');
+});
+
+/**
+ * Hourly cleanup of stale 'checkout-draft' orders ظ¤ these are created
+ * automatically by WooCommerce Blocks Checkout the moment a customer
+ * (or an attacker) loads the checkout page, before any payment attempt.
+ * ChargeGuard's real-time block (intercept_checkout_block() in
+ * class-dynamic-firewall.php) fires BEFORE the order is fully created,
+ * so there is no order_id yet to mark as 'failed' ظ¤ the draft is simply
+ * left behind. This is normal WooCommerce behavior (identical for a
+ * legitimate customer who abandons checkout) and not something the
+ * real-time block path can prevent by itself, so it is cleaned up here
+ * on a schedule instead.
+ *
+ * Only removes drafts older than 2 hours, well past any legitimate
+ * in-progress checkout, so a slow real customer is never at risk of
+ * having their in-progress order deleted out from under them.
+ */
+add_action('chargeguard_cleanup_stale_drafts', 'chargeguard_cleanup_stale_drafts');
+function chargeguard_cleanup_stale_drafts() {
+    if (!function_exists('wc_get_orders')) {
+        return;
+    }
+
+    $orders = wc_get_orders([
+        'status'       => 'checkout-draft',
+        'date_created' => '<' . (time() - 2 * HOUR_IN_SECONDS),
+        'limit'        => 100,
+        'return'       => 'ids',
+        // Defense in depth: a blocked order should already have moved to
+        // 'cancelled' via ChargeGuard_Dynamic_Firewall::mark_order_blocked()
+        // and therefore never match the status filter above — but excluding
+        // anything carrying _chargeguard_block_reason here too means this
+        // query can never delete a ChargeGuard forensic record even if a
+        // future code path leaves one behind in 'checkout-draft' state.
+        'meta_query'   => [
+            [
+                'key'     => '_chargeguard_block_reason',
+                'compare' => 'NOT EXISTS',
+            ],
+        ],
+    ]);
+
+    foreach ($orders as $order_id) {
+        $order = wc_get_order($order_id);
+        if ($order) {
+            $order->delete(true);
+        }
+    }
+
+    if (!empty($orders)) {
+        error_log('ChargeGuard: cleaned up ' . count($orders) . ' stale checkout-draft order(s).');
+    }
+}
+register_activation_hook(__FILE__, function () {
+    if (!wp_next_scheduled('chargeguard_cleanup_stale_drafts')) {
+        wp_schedule_event(time(), 'hourly', 'chargeguard_cleanup_stale_drafts');
+    }
+});
+register_deactivation_hook(__FILE__, function () {
+    wp_clear_scheduled_hook('chargeguard_cleanup_stale_drafts');
 });
 
 add_action('init', 'chargeguard_init_updater');

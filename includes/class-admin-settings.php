@@ -257,6 +257,21 @@ class ChargeGuard_Secret_Crypto {
 /**
  * Per-request read cache for chargeguard_get_secret_option(), shared with
  * chargeguard_update_secret_option() so a write can invalidate/refresh it.
+ *
+ * BUG FIX: the cache previously lived as `static $cache = []` local to
+ * chargeguard_get_secret_option() itself. That static persists for the
+ * whole PHP request — but chargeguard_update_secret_option() never
+ * touched it. If ANYTHING earlier in the same request (e.g. another
+ * class's constructor instantiating ChargeGuard_API_Client during
+ * chargeguard_init(), which runs before wp_ajax_chargeguard_connect)
+ * called chargeguard_get_secret_option('chargeguard_webhook_secret')
+ * even once, that value was cached for the rest of the request.
+ * ajax_connect() would then write the real, freshly-issued
+ * webhookSecret to the DB (Connect succeeds), but the very next read —
+ * inside the SAME request, when building the ChargeGuard_API_Client used
+ * for self_test() — silently returned the stale cached value instead,
+ * producing an HMAC signed with the wrong secret and a false signing
+ * self-test failure right after a successful connect.
  */
 class ChargeGuard_Secret_Option_Cache {
     private static $values = [];
@@ -300,13 +315,17 @@ function chargeguard_get_secret_option($name, $default = '') {
         }
         chargeguard_clear_secret_decrypt_failure($name);
         if ($migrated) {
+            // Was still encrypted under the legacy wp_salt('auth')-derived
+            // key; re-save under the current (CHARGEGUARD_ENCRYPTION_KEY)
+            // key now that we've proven we can read it.
             chargeguard_update_secret_option($name, $plaintext);
-            error_log('[ChargeGuard] Migrated option ' . $name . ' from legacy key to CHARGEGUARD_ENCRYPTION_KEY.');
+            error_log('[ChargeGuard] Migrated option ' . $name . ' from wp_salt-derived key to CHARGEGUARD_ENCRYPTION_KEY.');
         }
         ChargeGuard_Secret_Option_Cache::set($name, $plaintext);
         return $plaintext;
     }
 
+    // Legacy plaintext — self-heal in place; still return plaintext now.
     chargeguard_update_secret_option($name, $stored);
     ChargeGuard_Secret_Option_Cache::set($name, $stored);
     return $stored;
@@ -374,16 +393,23 @@ function chargeguard_clear_secret_decrypt_failure($name) {
 function chargeguard_update_secret_option($name, $value) {
     if (!is_string($value) || $value === '') {
         $result = update_option($name, $value);
+        // Keep the cache in sync even for the empty/non-string branch —
+        // an empty value is still a valid, deliberate value to cache.
         ChargeGuard_Secret_Option_Cache::set($name, $value);
         return $result;
     }
     $encrypted = ChargeGuard_Secret_Crypto::encrypt($value);
     if ($encrypted === false) {
-        error_log('[ChargeGuard] Failed to encrypt option ' . $name . ' - refusing to store plaintext.');
+        error_log('[ChargeGuard] Failed to encrypt option ' . $name . ' — refusing to store plaintext.');
+        // Do NOT cache on failure — force the next read to hit the DB
+        // again rather than silently caching a value we couldn't persist.
         ChargeGuard_Secret_Option_Cache::forget($name);
         return false;
     }
     $result = update_option($name, $encrypted);
+    // Cache the PLAINTEXT (not $encrypted) — chargeguard_get_secret_option()
+    // always returns plaintext to callers, and we already have it here for
+    // free without a redundant decrypt round-trip.
     ChargeGuard_Secret_Option_Cache::set($name, $value);
     return $result;
 }
@@ -438,6 +464,9 @@ class ChargeGuard_Admin_Settings {
         add_action('wp_ajax_chargeguard_store_deactivate',      [$this, 'ajax_store_deactivate']);
         add_action('wp_ajax_chargeguard_store_reactivate',      [$this, 'ajax_store_reactivate']);
         add_action('wp_ajax_chargeguard_check_for_updates',     [$this, 'ajax_check_for_updates']);
+        add_action('wp_ajax_chargeguard_rotate_key',            [$this, 'ajax_rotate_key']);
+        add_action('wp_ajax_chargeguard_dashboard_read',        [$this, 'ajax_dashboard_read']);
+        add_action('admin_post_chargeguard_view_dashboard',     [$this, 'render_dashboard_page']);
 
         // Align the Settings API's save-time capability check with the
         // capability actually required to reach this settings page
@@ -662,6 +691,157 @@ class ChargeGuard_Admin_Settings {
         }
         ChargeGuard_Plugin_Updater::force_check();
         wp_send_json_success(['message' => 'Checked for updates.']);
+    }
+
+    /**
+     * Proxies the ChargeGuard cloud dashboard (routes/dashboard.js
+     * GET /api/dashboard/page on the backend) through WordPress so the
+     * merchant's browser never sees or needs the raw X-Api-Key. The
+     * plugin already holds the key server-side (chargeguard_get_secret_option),
+     * so this makes a server-to-server request with it as a header, then
+     * streams the resulting HTML back to the merchant's browser verbatim.
+     *
+     * Reached via admin-post.php rather than add_submenu_page() so the
+     * response is NOT wrapped in the wp-admin chrome (menu/header/footer)
+     * — the dashboard is a complete, self-styled page (dark theme, its
+     * own <html>/<head>) meant to render standalone, exactly like it does
+     * when accessed directly on the backend.
+     */
+    public function ajax_rotate_key() {
+        check_ajax_referer('chargeguard_connect_nonce', 'nonce');
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(['message' => 'Unauthorized'], 403);
+        }
+        $api_key = chargeguard_get_secret_option('chargeguard_api_key');
+        if (!$api_key) {
+            wp_send_json_error(['message' => 'Store not connected.']);
+        }
+        $response = wp_remote_post('https://chargeguard-api.onrender.com/api/dashboard/rotate-key', [
+            'timeout' => 20,
+            'headers' => ['X-Api-Key' => $api_key],
+        ]);
+        if (is_wp_error($response)) {
+            wp_send_json_error(['message' => 'Could not reach ChargeGuard server.']);
+        }
+        $code = wp_remote_retrieve_response_code($response);
+        $body = json_decode(wp_remote_retrieve_body($response), true);
+        if ($code !== 200) {
+            wp_send_json_error(['message' => $body['error'] ?? 'Rotation failed.']);
+        }
+        update_option('chargeguard_api_key', sanitize_text_field($body['newApiKey']));
+        wp_send_json_success([
+            'newApiKey' => $body['newApiKey'],
+            'message'   => $body['message'] ?? 'API key rotated successfully.',
+        ]);
+    }
+
+    /**
+     * Generic read-only proxy for bin-sequence-alerts / orders /
+     * orders/export.csv — same rationale as ajax_rotate_key(): the
+     * merchant's browser never needs the raw X-Api-Key. Shares the
+     * read-only chargeguard_connect_nonce since every endpoint here is a
+     * side-effect-free GET.
+     */
+    public function ajax_dashboard_read() {
+        check_ajax_referer('chargeguard_connect_nonce', 'nonce');
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error(['message' => 'Unauthorized'], 403);
+        }
+
+        $allowed  = ['bin-sequence-alerts', 'orders', 'orders/export.csv'];
+        $endpoint = isset($_GET['endpoint']) ? sanitize_text_field(wp_unslash($_GET['endpoint'])) : '';
+        if (!in_array($endpoint, $allowed, true)) {
+            wp_send_json_error(['message' => 'Invalid endpoint'], 400);
+        }
+
+        $api_key = chargeguard_get_secret_option('chargeguard_api_key');
+        if (!$api_key) {
+            wp_send_json_error(['message' => 'Store not connected.']);
+        }
+
+        $qs = [];
+        foreach (['page', 'limit', 'email', 'orderId', 'storeId'] as $p) {
+            if (isset($_GET[$p])) {
+                $qs[$p] = sanitize_text_field(wp_unslash($_GET[$p]));
+            }
+        }
+        $url = 'https://chargeguard-api.onrender.com/api/dashboard/' . $endpoint;
+        if ($qs) {
+            $url .= '?' . http_build_query($qs);
+        }
+
+        $response = wp_remote_get($url, [
+            'timeout' => 20,
+            'headers' => ['X-Api-Key' => $api_key],
+        ]);
+
+        if (is_wp_error($response)) {
+            wp_send_json_error(['message' => 'Could not reach ChargeGuard server.']);
+        }
+
+        $code = wp_remote_retrieve_response_code($response);
+        $body = wp_remote_retrieve_body($response);
+
+        if ($endpoint === 'orders/export.csv') {
+            status_header($code ?: 500);
+            header('Content-Type: text/csv; charset=utf-8');
+            header('Content-Disposition: attachment; filename="chargeguard-orders.csv"');
+            echo $body;
+            exit;
+        }
+
+        status_header($code ?: 500);
+        header('Content-Type: application/json');
+        echo $body;
+        exit;
+    }
+
+    public function render_dashboard_page() {
+        if (!current_user_can('manage_woocommerce')) {
+            wp_die(esc_html__('Unauthorized', 'chargeguard-woocommerce'), '', ['response' => 403]);
+        }
+        check_admin_referer('chargeguard_view_dashboard_nonce');
+
+        $api_key = chargeguard_get_secret_option('chargeguard_api_key');
+        if (!$api_key) {
+            wp_die(esc_html__('Store not connected. Please connect ChargeGuard first.', 'chargeguard-woocommerce'));
+        }
+
+        $response = wp_remote_get('https://chargeguard-api.onrender.com/api/dashboard/page', [
+            'timeout' => 20,
+            'headers' => [
+                'X-Api-Key' => $api_key,
+            ],
+        ]);
+
+        if (is_wp_error($response)) {
+            wp_die(esc_html__('Could not reach the ChargeGuard dashboard. Please try again shortly.', 'chargeguard-woocommerce'));
+        }
+
+        $code = wp_remote_retrieve_response_code($response);
+        $body = wp_remote_retrieve_body($response);
+
+        if ($code !== 200 || empty($body)) {
+            wp_die(esc_html__('The ChargeGuard dashboard is currently unavailable. Please try again shortly.', 'chargeguard-woocommerce'));
+        }
+
+        // The backend already sends its own Content-Type/no-store/X-Robots-Tag
+        // headers for this route (see dashboard.js buildDashboardHtml response),
+        // but they aren't forwarded by wp_remote_get() — set them explicitly here.
+        header('Content-Type: text/html; charset=utf-8');
+        header('Cache-Control: no-store');
+        header('X-Robots-Tag: noindex, nofollow');
+        $injected = '<script>window.cgWP = ' . wp_json_encode([
+            'ajaxUrl' => admin_url('admin-ajax.php'),
+            'nonce'   => wp_create_nonce('chargeguard_connect_nonce'),
+        ]) . ';</script></head>';
+        $body = str_replace('</head>', $injected, $body);
+
+        // phpcs:ignore WordPress.Security.EscapeOutput -- trusted same-account
+        // ChargeGuard backend response; user-controlled fields inside it are
+        // already HTML-escaped server-side (see escapeHtml() in dashboard.js).
+        echo $body;
+        exit;
     }
 
     /**
@@ -1465,7 +1645,7 @@ class ChargeGuard_Admin_Settings {
             wp_send_json_error( [ 'message' => 'Please save your Stripe secret key first.' ] );
         }
 
-        $stripe_init = __DIR__ . '/../vendor/stripe/stripe-php/init.php';
+        $stripe_init = __DIR__ . '/../vendor/stripe-php/init.php';
         if ( ! file_exists( $stripe_init ) ) {
             wp_send_json_error( [ 'message' => 'Stripe SDK not installed. Run composer install.' ] );
         }
@@ -1558,12 +1738,18 @@ class ChargeGuard_Admin_Settings {
                         <div class="cg-dot green"></div>
                         Active — Your store is protected
                     </div>
-                    <button type="button" id="cg-verify-key-btn" class="button">
+                    <a href="<?php echo esc_url( wp_nonce_url( admin_url( 'admin-post.php?action=chargeguard_view_dashboard' ), 'chargeguard_view_dashboard_nonce' ) ); ?>"
+                       target="_blank" rel="noopener noreferrer"
+                       class="button button-primary" style="margin-left:8px;">
+                        📊 <?php esc_html_e( 'View Full Dashboard', 'chargeguard-woocommerce' ); ?>
+                    </a>
+                    <button type="button" id="cg-verify-key-btn" class="button" style="margin-left:8px;">
                         <?php esc_html_e( 'Verify Key', 'chargeguard-woocommerce' ); ?>
                     </button>
                     <button type="button" id="cg-check-updates-btn" class="button" style="margin-left:8px;">
                         <?php esc_html_e( 'Check for Updates', 'chargeguard-woocommerce' ); ?>
                     </button>
+            
                 </div>
                 <div id="cg-key-status" style="display:none;font-size:12px;padding:6px 10px;border-radius:6px;margin-bottom:10px;"></div>
                 <div class="cg-info-row">

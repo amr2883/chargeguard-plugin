@@ -52,11 +52,11 @@ class ChargeGuard_Stripe_Webhook {
             return new \WP_REST_Response(['status' => 'disabled'], 200);
         }
 
-        $stripe_init = __DIR__ . '/../vendor/stripe/stripe-php/init.php';
+        $stripe_init = __DIR__ . '/../vendor/stripe-php/init.php';
         if (file_exists($stripe_init)) {
             require_once $stripe_init;
         } else {
-            error_log('[ChargeGuard] Stripe webhook received but vendor/stripe/stripe-php/init.php is missing — run composer install.');
+            error_log('[ChargeGuard] Stripe webhook received but vendor/stripe-php/init.php is missing — run composer install.');
             return new \WP_REST_Response(['error' => 'Unable to process webhook'], 500);
         }
 
@@ -417,17 +417,20 @@ class ChargeGuard_Stripe_Webhook {
      * @return \WP_REST_Response
      */
     private function handle_dispute_closed($event, $cache_key) {
-        $dispute = $event->data->object;
-        $status  = $dispute->status ?? null;
+    $dispute = $event->data->object;
+    $status  = $dispute->status ?? null;
 
-        // Documented terminal statuses: lost / won / warning_closed.
-        // Only 'lost' is a confirmed merchant loss. This branch is
-        // deterministic given the payload — status cannot change on
-        // redelivery — so it's safe to mark processed immediately.
-        if ($status !== 'lost') {
-            set_transient($cache_key, 1, 48 * HOUR_IN_SECONDS);
-            return new \WP_REST_Response(['status' => 'ignored', 'dispute_status' => $status], 200);
-        }
+    // [Learning-loop symmetry fix] 'warning_closed' لوحدها بلا قرار نهائي
+    // مؤكد بتُتجاهل. 'won' دلوقتي بيُعالَج زي 'lost' (نفس نداء send_feedback،
+    // isFraud=false) — قبل كده كان بيُتجاهل زي warning_closed، ومعناه إن
+    // SignalStat كانت بتتغذى بخسائر فقط، فالـ lossRate لأي إشارة (شاملة
+    // IP_TOR/IP_DATACENTER/BIN_PREPAID المستخدمة لكشف الكارد تيستنج) كانت
+    // بتتجه بمرور الوقت لـ 1.0 بلا اعتبار لمعدل ظهورها الحقيقي في الأوردرات
+    // الشرعية اللي كسبت نزاعاتها.
+    if ($status !== 'lost' && $status !== 'won') {
+        set_transient($cache_key, 1, 48 * HOUR_IN_SECONDS);
+        return new \WP_REST_Response(['status' => 'ignored', 'dispute_status' => $status], 200);
+    }
 
         $order_id = $this->find_order_id_for_dispute($dispute);
 
@@ -446,12 +449,18 @@ class ChargeGuard_Stripe_Webhook {
         // higher-value signal and must not be blocked by this step.
         // Canonical accessor — see ChargeGuard_Dynamic_Firewall::get_order_device_fp()
         // for the read-both (canonical + legacy), write-one rationale.
-        $device_fp = ChargeGuard_Dynamic_Firewall::get_order_device_fp($order_id);
-        if (!empty($device_fp) && $device_fp !== 'unknown') {
-            do_action('chargeguard_mark_device_fraud', $device_fp, 'stripe_dispute_lost');
-        }
+        $is_fraud = ($status === 'lost');
 
-        $result = $this->api_client->send_feedback($order_id, true);
+        if ($is_fraud) {
+            $device_fp = ChargeGuard_Dynamic_Firewall::get_order_device_fp($order_id);
+            if (!empty($device_fp) && $device_fp !== 'unknown') {
+                do_action('chargeguard_mark_device_fraud', $device_fp, 'stripe_dispute_lost');
+            }
+        }
+        // isFraud=false هنا هي الإصلاح — كانت مفيش خالص قبل كده، يعني كل
+        // نزاع كسبه التاجر كان بيتفوّت 100% من SignalStat (صفر تسجيل، مش
+        // حتى "خسارة صفرية").
+        $result = $this->api_client->send_feedback($order_id, $is_fraud);
 
         if (is_wp_error($result)) {
             // Do NOT mark processed. A confirmed 'lost' dispute is a
