@@ -1119,7 +1119,7 @@ class ChargeGuard_Dynamic_Firewall {
         }
 
         $decision = isset($result['decision']) ? $result['decision'] : '';
-        $blocked_reason = isset($result['blocked_reason']) ? $result['blocked_reason'] : '';
+        $blocked_reason = $result['blocked_reason'] ?? $result['reason'] ?? '';
         $limited_scoring = !empty($result['limitedScoring']);
 
         // Quota-exhausted orders now come back as decision: 'approve' — the
@@ -1234,7 +1234,7 @@ class ChargeGuard_Dynamic_Firewall {
         error_log('ChargeGuard checkout evaluated — pre_order_id: ' . $this->pre_order_id . ', decision: ' . (isset($result['decision']) ? $result['decision'] : 'unknown'));
 
         $decision = isset($result['decision']) ? $result['decision'] : '';
-        $blocked_reason = isset($result['blocked_reason']) ? $result['blocked_reason'] : '';
+        $blocked_reason = $result['blocked_reason'] ?? $result['reason'] ?? '';
         $limited_scoring = !empty($result['limitedScoring']);
 
         // Quota-exhausted orders come back as decision: 'approve' — the
