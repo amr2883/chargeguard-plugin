@@ -180,4 +180,35 @@ class ChargeGuard_Trusted_Proxy {
         }
         return false;
     }
+
+    /**
+     * Resolves the real client IP from a raw X-Forwarded-For header value.
+     * Called ONLY after REMOTE_ADDR has already been verified to sit
+     * inside a trusted proxy's CIDR range (see get_client_ip() in
+     * class-dynamic-firewall.php) — never on its own.
+     *
+     * SECURITY: deliberately does NOT take the first (leftmost) entry
+     * the way WC_Geolocation::get_ip_address() does. A client can freely
+     * send "X-Forwarded-For: <fake>, <real>", and a proxy that appends
+     * rather than replaces the header (the common nginx
+     * $proxy_add_x_forwarded_for behavior, and the default for most
+     * reverse proxies / load balancers) leaves that fake IP untouched
+     * at the front of the chain.
+     *
+     * Instead this takes the LAST (rightmost) syntactically valid IP —
+     * the entry our own trusted proxy hop is responsible for appending,
+     * and therefore the only one we can actually vouch for. This is a
+     * single-trusted-hop model; it does not attempt to walk a
+     * multi-proxy trusted chain.
+     */
+    public static function resolve_ip_from_forwarded_header($header_value) {
+        $parts = explode(',', (string) $header_value);
+        for ($i = count($parts) - 1; $i >= 0; $i--) {
+            $candidate = trim($parts[$i]);
+            if ($candidate !== '' && filter_var($candidate, FILTER_VALIDATE_IP)) {
+                return $candidate;
+            }
+        }
+        return '';
+    }
 }

@@ -157,11 +157,12 @@ class ChargeGuard_Dynamic_Firewall {
         $trusted_cidrs = ChargeGuard_Trusted_Proxy::get_custom_proxy_cidrs();
         if ( ! empty( $trusted_cidrs )
             && ChargeGuard_Trusted_Proxy::ip_in_any_cidr( $remote_addr, $trusted_cidrs )
-            && class_exists( 'WC_Geolocation' )
+            && ! empty( $_SERVER['HTTP_X_FORWARDED_FOR'] )
         ) {
-            $wc_ip = WC_Geolocation::get_ip_address();
-            if ( ! empty( $wc_ip ) ) {
-                return $wc_ip;
+            $xff_raw = sanitize_text_field( wp_unslash( $_SERVER['HTTP_X_FORWARDED_FOR'] ) );
+            $xff_ip  = ChargeGuard_Trusted_Proxy::resolve_ip_from_forwarded_header( $xff_raw );
+            if ( ! empty( $xff_ip ) && rest_is_ip_address( $xff_ip ) ) {
+                return $xff_ip;
             }
         }
     }
