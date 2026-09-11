@@ -162,6 +162,22 @@ class ChargeGuard_Stripe_Webhook {
         $expMonth = $card->exp_month ?? null;
         $expYear  = $card->exp_year ?? null;
 
+        // Post-payment card-fingerprint signal (Layer 5 — see
+        // src/lib/binSequenceDetector.js's checkCardFingerprintVelocity
+        // and src/lib/enrichmentProcessor.js on the backend).
+        // card->fingerprint is a Stripe-generated, non-reversible token
+        // identifying the underlying physical card across payment
+        // methods — it is NOT raw PAN data, so forwarding/storing it
+        // does not expand PCI scope (same sensitivity tier as
+        // deviceFingerprint, already sent today). wallet->type is
+        // forwarded purely as forensic context — Apple Pay/Google Pay
+        // produce a different fingerprint per device-token even for the
+        // identical physical card, a documented limitation of this
+        // layer, not a bug — it is never itself used in the velocity
+        // decision.
+        $card_fingerprint = $card->fingerprint ?? null;
+        $card_wallet_type = $card->wallet->type ?? null;
+
         if (!$iin) {
             // Deterministic — the same card data will lack an IIN on retry too.
             set_transient($cache_key, 1, 48 * HOUR_IN_SECONDS);
@@ -221,6 +237,8 @@ class ChargeGuard_Stripe_Webhook {
                 'expYear'     => $expYear,
                 'brand'       => $brand,
                 'deviceToken' => $device_token,
+                'cardFingerprint' => $card_fingerprint,
+                'cardWalletType'  => $card_wallet_type,
             ], HOUR_IN_SECONDS);
             // Data is now safely persisted for the deferred consumer to
             // pick up — this delivery has concluded successfully, so mark
@@ -244,6 +262,8 @@ class ChargeGuard_Stripe_Webhook {
             'expYear'         => $expYear,
             'brand'           => $brand,
             'deviceToken'     => $device_token,
+            'cardFingerprint' => $card_fingerprint,
+            'cardWalletType'  => $card_wallet_type,
         ];
 
         $result = $this->api_client->send_enrich($enrich_data);

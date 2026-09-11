@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 /**
  * ChargeGuard - Dynamic Firewall
  *
@@ -64,6 +64,42 @@ class ChargeGuard_Dynamic_Firewall {
     const MAX_BLACKLIST_SIZE = 500;
 
     /**
+     * Local (PHP-side) device attempt counter — determines whether this
+     * checkout is the device's 2nd+ attempt within the window, and
+     * therefore whether it's worth paying the cost of a Stripe API round
+     * trip to fetch card.fingerprint. A first-time legitimate customer
+     * never triggers the Stripe call at all — zero added latency for the
+     * overwhelming majority of checkouts.
+     *
+     * Window matches the backend's rawVelocityDetector.js
+     * RAW_VELOCITY_WINDOW_MINUTES default (10 min) by design — both
+     * counters are conceptually tracking "how many times has this exact
+     * device attempted checkout recently," just at two different layers
+     * (PHP pre-authorization gate vs. Node.js post-request analytics).
+     * They do not need to share storage; independent counters answering
+     * the same question are fine here since this one only gates a local
+     * decision (call Stripe or not), not a block decision by itself.
+     */
+    const CARD_FP_ATTEMPT_WINDOW_SECONDS = 600; // 10 minutes
+    const CARD_FP_ATTEMPT_THRESHOLD      = 2;   // 2nd+ attempt triggers the Stripe lookup
+
+    /**
+     * Lightweight circuit breaker for the Stripe get_payment_method()
+     * call specifically — deliberately separate from
+     * ChargeGuard_API_Client's breaker (self::CIRCUIT_*), which monitors
+     * the ChargeGuard backend's health, not Stripe's. Stripe being slow
+     * or briefly unreachable must never be conflated with — or allowed
+     * to open — the ChargeGuard API circuit, since that would disable
+     * unrelated protections for no reason. This breaker only ever
+     * suppresses the card-fingerprint lookup itself; it can never block
+     * a checkout on its own.
+     */
+    const CARD_FP_CIRCUIT_FAILURE_TRANSIENT = 'cg_cardfp_circuit_failures';
+    const CARD_FP_CIRCUIT_OPEN_TRANSIENT    = 'cg_cardfp_circuit_open';
+    const CARD_FP_CIRCUIT_FAILURE_THRESHOLD = 3;
+    const CARD_FP_CIRCUIT_OPEN_SECONDS      = 60;
+
+    /**
      * Merchant-configurable behavior when evaluate_risk() cannot reach the
      * backend — whether because the circuit breaker is open, or because a
      * single request failed/5xx'd (both mean "no authoritative decision is
@@ -102,10 +138,14 @@ class ChargeGuard_Dynamic_Firewall {
      * When trusted-proxy mode is on:
      *   1. CF-Connecting-IP — set exclusively by Cloudflare on every proxied
      *      request; preferred over generic X-Forwarded-For when present.
-     *   2. WC_Geolocation::get_ip_address() — WooCommerce core's header
-     *      parser (X-Real-IP, then X-Forwarded-For first-hop, then
-     *      REMOTE_ADDR), reused here for its battle-tested parsing/
-     *      validation rather than reimplementing header-chain parsing.
+     *   2. ChargeGuard_Trusted_Proxy::resolve_ip_from_forwarded_header() —
+     *      takes the LAST (rightmost) syntactically valid IP in
+     *      X-Forwarded-For, i.e. the hop our own trusted proxy appended,
+     *      never the leftmost/client-Supplied one. Deliberately does NOT
+     *      use WC_Geolocation::get_ip_address() here, which takes the
+     *      FIRST entry and was found to be trivially spoofable via
+     *      "X-Forwarded-for: <fake>, <real>" even with a fully-verified
+     *      trusted remote_addr (confirmed via multi-hop xff testing).
      *   3. REMOTE_ADDR — final fallback if neither header is present.
      *
      * This method is the single source of truth for IP resolution in this
@@ -130,6 +170,7 @@ class ChargeGuard_Dynamic_Firewall {
     $remote_addr = isset( $_SERVER['REMOTE_ADDR'] )
         ? sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) )
         : '';
+
 
     if ( $mode === 'off' || $remote_addr === '' ) {
         return $remote_addr;
@@ -260,6 +301,61 @@ class ChargeGuard_Dynamic_Firewall {
         // بالتقييم الأصلي. Blocks checkout لا يحتاج هذا لأنه يستخدم معرف
         // الطلب الحقيقي منذ البداية.
         add_action('woocommerce_checkout_order_created', [$this, 'reconcile_pre_order_id']);
+
+        // 7. Graduated OTP challenge (low-and-slow evasion fix) — registers
+        // an optional Additional Checkout Field. Must run on woocommerce_init
+        // per WooCommerce's own documented registration timing, which is
+        // BEFORE any visitor-specific data (fingerprint, risk decision)
+        // exists — this is exactly why the field must always render as
+        // optional rather than being conditionally shown (see
+        // register_otp_checkout_field() below for the full rationale).
+        add_action('woocommerce_init', [$this, 'register_otp_checkout_field']);
+    }
+
+    /**
+     * Registers the optional 'chargeguard/otp' Additional Checkout Field
+     * (Blocks/Store API only — see class docblock's note on Classic
+     * checkout being deferred). Rendered at the 'order' location (near
+     * order notes, away from primary contact/payment fields) so it reads
+     * as an edge-case field, not a mandatory step for every customer.
+     *
+     * WHY ALWAYS OPTIONAL, NEVER CONDITIONALLY HIDDEN: WooCommerce Blocks'
+     * conditional hidden/required logic evaluates only against a fixed,
+     * pre-defined document object (cart/address/order totals) — there is
+     * no documented mechanism to inject a custom "is this device
+     * currently challenged?" signal into that evaluation, and that signal
+     * would not exist yet anyway at woocommerce_init (registration time),
+     * long before any request-specific risk decision is made. The field
+     * is therefore always visible but ignorable by the ~99% of customers
+     * who never trip the challenge tier; all real enforcement happens
+     * server-side in intercept_checkout_block(), not via this field's
+     * required/hidden state.
+     *
+     * sanitize_callback deliberately does NOT persist the raw 6-digit
+     * code into order meta (WooCommerce's Additional Fields API stores
+     * whatever this returns permanently under order meta
+     * `_wc_other/chargeguard/otp`) — the raw value is read directly from
+     * $request->get_param('additional_fields') inside
+     * intercept_checkout_block(), the same pattern already used for
+     * payment_data in maybe_get_card_fingerprint(). This avoids leaving a
+     * customer's verification code sitting in the clear in permanent
+     * order meta indefinitely, visible to any shop manager.
+     */
+    public function register_otp_checkout_field() {
+        if (!function_exists('woocommerce_register_additional_checkout_field')) {
+            return; // Older WooCommerce without Blocks Additional Fields support.
+        }
+
+        woocommerce_register_additional_checkout_field([
+            'id'                => 'chargeguard/otp',
+            'label'             => __('Verification code (only if you received one by email)', 'chargeguard-woocommerce'),
+            'location'          => 'order',
+            'type'              => 'text',
+            'required'          => false,
+            'sanitize_callback' => function ($field_value) {
+                return !empty($field_value) ? '[submitted]' : '';
+            },
+        ]);
     }
 
     // ─────────────────────────────────────────────
@@ -574,9 +670,13 @@ class ChargeGuard_Dynamic_Firewall {
             $limit  = (int) apply_filters('chargeguard_api_down_rate_limit', (int) get_option(self::API_DOWN_RATE_LIMIT_OPTION, self::API_DOWN_RATE_LIMIT_DEFAULT_MAX));
             $window = (int) apply_filters('chargeguard_api_down_rate_limit_window', self::API_DOWN_RATE_LIMIT_WINDOW);
             $key    = self::API_DOWN_RATE_LIMIT_TRANSIENT_PREFIX . md5($ip);
-            $count  = (int) get_transient($key);
-            $count++;
-            set_transient($key, $count, $window);
+            // [TOCTOU fix] Atomic, InnoDB-lock-based increment — replaces
+            // the non-atomic get_transient()/set_transient() pair, which
+            // let concurrent requests from the same IP all read the same
+            // stale count and lose increments. See
+            // ChargeGuard_Atomic_Rate_Limiter's class-level doc comment
+            // for the full rationale.
+            $count = ChargeGuard_Atomic_Rate_Limiter::increment($key, $window);
             if ($count > $limit) {
                 return ['decision' => 'block', 'reason' => 'api_unavailable_rate_limited', 'local_block_type' => 'velocity'];
             }
@@ -628,6 +728,61 @@ class ChargeGuard_Dynamic_Firewall {
      *
      * @param string $reason One of resolve_api_unavailable_decision()'s reason strings.
      */
+    const CHALLENGE_DELIVERY_FAILED_RATE_LIMIT_MAX    = 3;
+    const CHALLENGE_DELIVERY_FAILED_RATE_LIMIT_WINDOW = HOUR_IN_SECONDS;
+    const CHALLENGE_DELIVERY_FAILED_NOTICE_OPTION     = 'chargeguard_challenge_delivery_failed_notice';
+
+    /**
+     * نفس منطق check_device_blacklist() (سطر 352) لكن reusable وبترجع bool
+     * بدل الاعتماد على $_cookie مباشرة. الفورمات نفسه: array مسطّح
+     * fingerprint => expires_timestamp (مطابق لـ blacklist_option في كل الملف).
+     */
+    private function is_device_blacklisted_fp($device_fp) {
+        if (empty($device_fp)) {
+            return false;
+        }
+
+        $local_blacklist = get_option($this->blacklist_option, []);
+        if (!is_array($local_blacklist)) {
+            return false;
+        }
+
+        $now = time();
+        $changed = false;
+        foreach ($local_blacklist as $fp => $expires) {
+            if ($expires < $now) {
+                unset($local_blacklist[$fp]);
+                $changed = true;
+            }
+        }
+        if ($changed) {
+            update_option($this->blacklist_option, $local_blacklist, false);
+        }
+
+        return isset($local_blacklist[$device_fp]) && $local_blacklist[$device_fp] > $now;
+    }
+
+    /**
+     * إشعار الأدمن عند فشل تسليم otp — نفس pattern notify_admin_api_unavailable() حرفيًا.
+     */
+    private function notify_admin_challenge_delivery_failed($device_fp, $order_id, $reason) {
+        $status = get_option(self::CHALLENGE_DELIVERY_FAILED_NOTICE_OPTION, []);
+        if (!is_array($status)) {
+            $status = [];
+        }
+        $window_start = isset($status['window_start']) ? (int) $status['window_start'] : 0;
+        $now = time();
+        if (!$window_start || ($now - $window_start) > HOUR_IN_SECONDS) {
+            $status = ['window_start' => $now, 'count' => 0];
+        }
+        $status['count']       = (isset($status['count']) ? (int) $status['count'] : 0) + 1;
+        $status['last_reason'] = $reason . ' (device=' . $device_fp . ', order=' . $order_id . ')';
+        $status['last_at']     = $now;
+        update_option(self::CHALLENGE_DELIVERY_FAILED_NOTICE_OPTION, $status, false);
+
+        error_log('chargeguard: challenge delivery failed — applied fallback decision (' . $reason . ') for order #' . $order_id . '.');
+    }
+
     private function notify_admin_api_unavailable($reason) {
         $status = get_option(self::API_DOWN_STATUS_OPTION, []);
         if (!is_array($status)) {
@@ -998,7 +1153,173 @@ class ChargeGuard_Dynamic_Firewall {
      * checkout the customer is using. A Blocks-compatible pre-emptive
      * warning is tracked for a future release.
      */
+    /**
+     * increments and returns the local attempt count for a device within
+     * the card_fp_attempt_window_seconds window. untrusted input
+     * ($device_fp is client-supplied, same trust boundary as everywhere
+     * else in this file) — used only as a local cost-gating heuristic
+     * here, never as a security decision by itself.
+     *
+     * @param string $device_fp
+     * @return int the new count, including this attempt.
+     */
+    private function increment_local_device_attempt_count($device_fp) {
+        if (empty($device_fp) || $device_fp === 'unknown') {
+            return 0;
+        }
+        $key = 'cg_devattempt_' . md5($device_fp);
+        $count = (int) get_transient($key);
+        $count++;
+        set_transient($key, $count, self::CARD_FP_ATTEMPT_WINDOW_SECONDS);
+        return $count;
+    }
+
+    /**
+     * whether the stripe card-fingerprint circuit breaker is currently
+     * open (skip the stripe call and proceed without cardfingerprint).
+     *
+     * @return bool
+     */
+    private function is_card_fp_circuit_open() {
+        return (bool) get_transient(self::CARD_FP_CIRCUIT_OPEN_TRANSIENT);
+    }
+
+    /**
+     * records a failed stripe get_payment_method() call. opens the
+     * breaker after card_fp_circuit_failure_threshold consecutive
+     * failures. same accepted low-severity race as
+     * chargeguard_api_client::record_failure() — non-atomic
+     * read-increment-write, self-correcting, not worth the complexity of
+     * an atomic fix for a purely cost-saving (not security-critical)
+     * circuit.
+     */
+    private function record_card_fp_failure() {
+        $failures = (int) get_transient(self::CARD_FP_CIRCUIT_FAILURE_TRANSIENT);
+        $failures++;
+        set_transient(self::CARD_FP_CIRCUIT_FAILURE_TRANSIENT, $failures, self::CARD_FP_CIRCUIT_OPEN_SECONDS * 2);
+
+        if ($failures >= self::CARD_FP_CIRCUIT_FAILURE_THRESHOLD) {
+            set_transient(self::CARD_FP_CIRCUIT_OPEN_TRANSIENT, time(), self::CARD_FP_CIRCUIT_OPEN_SECONDS);
+            error_log('chargeguard: card-fingerprint circuit breaker opened after ' . $failures . ' consecutive stripe get_payment_method() failures — skipping this lookup for ' . self::CARD_FP_CIRCUIT_OPEN_SECONDS . 's.');
+        }
+    }
+
+    /**
+     * records a successful stripe get_payment_method() call — resets the
+     * failure counter and closes the breaker if it was open.
+     */
+    private function record_card_fp_success() {
+        delete_transient(self::CARD_FP_CIRCUIT_FAILURE_TRANSIENT);
+        if (get_transient(self::CARD_FP_CIRCUIT_OPEN_TRANSIENT)) {
+            delete_transient(self::CARD_FP_CIRCUIT_OPEN_TRANSIENT);
+            error_log('chargeguard: card-fingerprint circuit breaker closed — stripe reachable again.');
+        }
+    }
+
+    /**
+     * attempts to resolve card.fingerprint for the current checkout, but
+     * only when it's actually worth the cost: the device must be on its
+     * 2nd+ attempt within the window (see increment_local_device_attempt_count()),
+     * and a stripe payment_method id must actually be present on this
+     * request.
+     *
+     * known limitation (verify against your actual checkout flow): on
+     * woocommerce blocks with stripe's deferred-intent upe / payment
+     * element flow, stripe.confirmpayment() — which is what actually
+     * creates/confirms the paymentmethod — typically runs client-side
+     * after this hook (checkout_update_order_from_request) has already
+     * fired. in that flow, no payment_method id may be available here at
+     * all, and this method will simply return null every time — which is
+     * safe (see the fail-safe design note below) but means this layer
+     * may provide zero additional coverage until/unless a
+     * pre-tokenization flow (e.g. legacy card element, or a
+     * deferred-intent variant that tokenizes before order update) is
+     * confirmed to be in use. this must be verified empirically (e.g.
+     * temporary error_log of $pm_id below) against the live site's
+     * actual stripe integration before relying on this layer's coverage.
+     *
+     * expects the payment_method id as store api extension data under
+     * the 'chargeguard' namespace, key 'payment_method_id' — populated
+     * client-side by assets/js/chargeguard-firewall.js (to be added in a
+     * later step). returns null (no-op) if any precondition fails —
+     * never throws, never delays checkout beyond the stripe call's own
+     * timeout, never blocks on its own.
+     *
+     * @param wp_rest_request $request
+     * @param string           $device_fp
+     * @return array{cardfingerprint:string,cardwallettype:?string}|null
+     */
+    private function maybe_get_card_fingerprint($request, $device_fp) {
+        if (empty($device_fp) || $device_fp === 'unknown') {
+            return null;
+        }
+
+        $attempt_count = $this->increment_local_device_attempt_count($device_fp);
+        if ($attempt_count < self::CARD_FP_ATTEMPT_THRESHOLD) {
+            return null; // first attempt — not worth the stripe round trip.
+        }
+
+        $payment_data = $request->get_param('payment_data');
+        $pm_id = null;
+        if (is_array($payment_data)) {
+            foreach ($payment_data as $item) {
+                if (isset($item['key'], $item['value']) && $item['key'] === 'wc-stripe-payment-method') {
+                    $pm_id = sanitize_text_field($item['value']);
+                    break;
+                }
+            }
+        }
+
+        if (empty($pm_id) || strpos($pm_id, 'pm_') !== 0) {
+            return null; // not present on this request — see limitation note above.
+        }
+
+        // version-gate: wc_stripe_api::get_payment_method() signature and
+        // stdclass response shape are only confirmed stable for this
+        // range (tested against woocommerce-gateway-stripe 10.8.4). an
+        // out-of-range version disables this feature automatically rather
+        // than risking undefined behavior against a response shape that
+        // may have changed.
+        if (
+            !class_exists('WC_Stripe_API')
+            || !method_exists('WC_Stripe_API', 'get_payment_method')
+            || !defined('WC_Stripe_Version')
+            || !version_compare(WC_Stripe_Version, '10.5.0', '>=')
+            || !version_compare(WC_Stripe_Version, '11.0.0', '<')
+        ) {
+            return null;
+        }
+
+        if ($this->is_card_fp_circuit_open()) {
+            return null;
+        }
+
+        try {
+            $pm = wc_stripe_api::get_payment_method($pm_id);
+        } catch (\Exception $e) {
+            $this->record_card_fp_failure();
+            error_log('chargeguard: wc_stripe_api::get_payment_method() failed — ' . $e->getmessage());
+            return null;
+        }
+
+        $this->record_card_fp_success();
+
+        // card.fingerprint is stripe-generated, not raw pan data — safe to
+        // forward and store (see prior design discussion: this does not
+        // expand pci scope, same sensitivity level as devicefingerprint).
+        if (!isset($pm->card->fingerprint) || !is_string($pm->card->fingerprint) || $pm->card->fingerprint === '') {
+            return null;
+        }
+
+        return [
+            'cardFingerprint' => $pm->card->fingerprint,
+            'cardWalletType'  => isset($pm->card->wallet->type) ? (string) $pm->card->wallet->type : null,
+        ];
+    }
+
     public function intercept_checkout_block($order, $request) {
+        if (defined('chargeguard_debug') && chargeguard_debug) {
+        }
         // Untrusted, client-forgeable value — see the trust-boundary
         // warning at the top of this file. The local blacklist check
         // just below is a cheap first-line heuristic only; evaluate_risk()
@@ -1010,6 +1331,20 @@ class ChargeGuard_Dynamic_Firewall {
         // checkout، لضمان عدم فقدان هذه الحماية إذا كان مفتاح الـ API غير
         // مُعد. يتم الفحص قبل استدعاء evaluate_risk() لتفادي استهلاك طلب
         // شبكة غير ضروري ولضمان الحظر حتى لو تعذّر الوصول للـ backend لاحقًا.
+        // persist the fingerprint first — before any block decision — so
+        // every order that carried a chargeguard_fp cookie has it recorded
+        // as order meta regardless of which branch below (local blacklist,
+        // api decision, or api-unavailable fallback) ultimately blocks or
+        // approves it. previously this ran only after the local-blacklist
+        // check below, so an order blocked by that check specifically
+        // never got '_chargeguard_device_fp' persisted — a forensic gap
+        // (the block itself was correct; only the audit trail was
+        // incomplete) discovered via distributed swarm testing.
+        if (!empty($device_fp) && $device_fp !== 'unknown') {
+            $order->update_meta_data('_chargeguard_device_fp', $device_fp);
+            $order->save_meta_data();
+        }
+
         if (!empty($device_fp)) {
             $local_blacklist = get_option($this->blacklist_option, []);
             if (is_array($local_blacklist) && isset($local_blacklist[$device_fp]) && $local_blacklist[$device_fp] > time()) {
@@ -1030,20 +1365,74 @@ class ChargeGuard_Dynamic_Firewall {
             }
         }
 
-        // Blocks checkout already has a real, persisted order at this point
-        // (unlike classic checkout, which needs reconcile_pre_order_id()).
-        // Persist the fingerprint now so post-payment webhook handlers can
-        // resolve it later regardless of what evaluate_risk() below decides.
-        if (!empty($device_fp) && $device_fp !== 'unknown') {
-            $order->update_meta_data('_chargeguard_device_fp', $device_fp);
-            $order->save_meta_data();
-        }
-
         if (!$this->api_client || !$this->api_client->get_api_key()) {
             return;
         }
         $ip = self::get_client_ip();
         $email = $order->get_billing_email();
+
+        // ── graduated otp challenge — verification portion ──────────────
+        // runs before evaluate_risk() so a valid ticket (existing or
+        // freshly minted here) is already available to attach to
+        // $order_data below — no separate round trip needed on the
+        // "customer already typed the code" path.
+        //
+        // reads the raw field value directly from the store api request,
+        // same pattern as maybe_get_card_fingerprint()'s payment_data
+        // read above — not from order meta, since
+        // register_otp_checkout_field()'s sanitize_callback deliberately
+        // stores only '[submitted]' there, never the real code.
+        $additional_fields = $request->get_param('additional_fields');
+        $otp_submitted = '';
+        if (is_array($additional_fields) && !empty($additional_fields['chargeguard/otp'])) {
+            $otp_submitted = sanitize_text_field(wp_unslash($additional_fields['chargeguard/otp']));
+        }
+
+        // httponly — same cookie-trust model as chargeguard_dt. proof this
+        // (device, email) pair already passed a challenge within 24h.
+        $challenge_ticket = isset($_COOKIE['chargeguard_ct']) ? sanitize_text_field(wp_unslash($_COOKIE['chargeguard_ct'])) : '';
+
+        if ($otp_submitted !== '' && !empty($device_fp) && !empty($email) && $this->api_client) {
+            $verify_result = $this->api_client->verify_challenge($otp_submitted, $device_fp, $email);
+
+            if (is_wp_error($verify_result)) {
+                // fail open — same philosophy as resolve_api_unavailable_decision()
+                // and maybe_get_card_fingerprint() elsewhere in this file: a
+                // connectivity problem reaching our backend is not the
+                // customer's fault. the code is simply dropped; evaluate_risk()
+                // below runs fresh and will re-request a challenge if still needed.
+                error_log('chargeguard: /challenge/verify unreachable — proceeding without a ticket: ' . $verify_result->get_error_message());
+            } elseif (!empty($verify_result['verified']) && !empty($verify_result['ticket'])) {
+                $challenge_ticket = $verify_result['ticket'];
+                setcookie('chargeguard_ct', $challenge_ticket, [
+                    'expires'  => time() + DAY_IN_SECONDS,
+                    'path'     => '/',
+                    'secure'   => is_ssl(),
+                    'httponly' => true,
+                    'samesite' => 'lax',
+                ]);
+                $_COOKIE['chargeguard_ct'] = $challenge_ticket;
+            } else {
+                // a definitive answer came back — the code was actually
+                // checked and is wrong/expired/rate-limited. this is not
+                // fail-open: the customer needs an actionable message, not
+                // a silent pass-through.
+                $message = !empty($verify_result['error'])
+                    ? sanitize_text_field($verify_result['error'])
+                    : __('the verification code you entered is incorrect or has expired. please check your email and try again.', 'chargeguard-woocommerce');
+
+                if (class_exists('\automattic\woocommerce\storeapi\exceptions\routeexception')) {
+                    throw new \automattic\woocommerce\storeapi\exceptions\routeexception(
+                        'chargeguard_challenge_incorrect',
+                        $message,
+                        400
+                    );
+                }
+                throw new \exception($message);
+            }
+        }
+        // ── end otp verification portion ─────────────────────────────────
+
         $amount = $order->get_total();
         $billing_country = $order->get_billing_country();
         $shipping_country = $order->get_shipping_country();
@@ -1081,10 +1470,25 @@ class ChargeGuard_Dynamic_Firewall {
             'billingCountry' => $billing_country,
             'shippingCountry' => $shipping_country,
             'merchantId' => get_option('chargeguard_merchant_id', ''),
+            'challengeTicket' => $challenge_ticket !== '' ? $challenge_ticket : null,
         ];
 
-        $result = $this->api_client->evaluate_risk($order_data);
+        // Pre-authorization card-fingerprint velocity signal — see
+        // maybe_get_card_fingerprint() above for the full rationale,
+        // preconditions, and the deferred-intent timing limitation that
+        // must be verified against this store's actual Stripe flow.
+        // Entirely additive and fail-safe: on any failure, missing
+        // precondition, or unsupported gateway version, $card_fp_data is
+        // null and $order_data is sent exactly as it was before this
+        // feature existed.
+        $card_fp_data = $this->maybe_get_card_fingerprint($request, $device_fp);
+        if ($card_fp_data !== null) {
+            $order_data['cardFingerprint'] = $card_fp_data['cardFingerprint'];
+            $order_data['cardWalletType']  = $card_fp_data['cardWalletType'];
+        }
 
+
+        $result = $this->api_client->evaluate_risk($order_data);
         if (is_wp_error($result)) {
             // Was previously: `return;` — an unconditional, silent
             // fail-open. This is the exploitable bypass: an attacker who
@@ -1120,7 +1524,7 @@ class ChargeGuard_Dynamic_Firewall {
         }
 
         $decision = isset($result['decision']) ? $result['decision'] : '';
-        $blocked_reason = $result['blocked_reason'] ?? $result['reason'] ?? '';
+                $blocked_reason = $result['blocked_reason'] ?? $result['reason'] ?? '';
         $limited_scoring = !empty($result['limitedScoring']);
 
         // Quota-exhausted orders now come back as decision: 'approve' — the
@@ -1136,6 +1540,67 @@ class ChargeGuard_Dynamic_Firewall {
             $this->notify_admin_quota_exceeded($blocked_reason);
         } elseif ($limited_scoring) {
             $this->notify_admin_quota_exceeded('limited_scoring');
+        }
+
+        if ($decision === 'challenge') {
+            $challenge_request = $this->api_client->request_challenge($device_fp, $email);
+
+            if (is_wp_error($challenge_request) || empty($challenge_request['emailSent'])) {
+
+                $failure_reason = is_wp_error($challenge_request)
+                    ? $challenge_request->get_error_message()
+                    : 'emailSent_empty';
+
+                if ($this->is_device_blacklisted_fp($device_fp)) {
+                    $this->notify_admin_challenge_delivery_failed($device_fp, $order->get_id(), $failure_reason . '_blacklisted');
+                    if (class_exists('\Automattic\WooCommerce\StoreApi\Exceptions\RouteException')) {
+                        throw new \Automattic\WooCommerce\StoreApi\Exceptions\RouteException(
+                            'chargeguard_order_blocked',
+                            __('Sorry, your order cannot be processed.', 'chargeguard-woocommerce'),
+                            400
+                        );
+                    }
+                    throw new \Exception(__('Sorry, your order cannot be processed.', 'chargeguard-woocommerce'));
+                }
+
+                $rl_key        = 'challenge_delivery_failed:' . $device_fp;
+                $attempt_count = ChargeGuard_Atomic_Rate_Limiter::increment(
+                    $rl_key,
+                    self::CHALLENGE_DELIVERY_FAILED_RATE_LIMIT_WINDOW
+                );
+
+                if ($attempt_count === 0) {
+                    $this->notify_admin_challenge_delivery_failed($device_fp, $order->get_id(), $failure_reason . '_rate_limiter_unavailable');
+                    error_log('chargeguard: rate limiter unavailable during challenge-delivery-failed path for order #' . $order->get_id() . ' — proceeding with blacklist-only protection');
+                } elseif ($attempt_count > self::CHALLENGE_DELIVERY_FAILED_RATE_LIMIT_MAX) {
+                    $this->notify_admin_challenge_delivery_failed($device_fp, $order->get_id(), $failure_reason . '_rate_limit_exceeded');
+                    if (class_exists('\Automattic\WooCommerce\StoreApi\Exceptions\RouteException')) {
+                        throw new \Automattic\WooCommerce\StoreApi\Exceptions\RouteException(
+                            'chargeguard_order_blocked',
+                            __('Sorry, your order cannot be processed.', 'chargeguard-woocommerce'),
+                            400
+                        );
+                    }
+                    throw new \Exception(__('Sorry, your order cannot be processed.', 'chargeguard-woocommerce'));
+                } else {
+                    $this->notify_admin_challenge_delivery_failed($device_fp, $order->get_id(), $failure_reason);
+                    error_log('chargeguard: challenge requested but email delivery unconfirmed — proceeding under rate limit (' . $attempt_count . '/' . self::CHALLENGE_DELIVERY_FAILED_RATE_LIMIT_MAX . ') for order #' . $order->get_id());
+                }
+            } else {
+                $order->update_meta_data('_chargeguard_challenge_requested_at', time());
+                $order->save_meta_data();
+
+                $message = __('For your security, we sent a verification code to your email. Please enter it in the "Verification code" field below and place your order again.', 'chargeguard-woocommerce');
+
+                if (class_exists('\Automattic\WooCommerce\StoreApi\Exceptions\RouteException')) {
+                    throw new \Automattic\WooCommerce\StoreApi\Exceptions\RouteException(
+                        'chargeguard_challenge_required',
+                        $message,
+                        400
+                    );
+                }
+                throw new \Exception($message);
+            }
         }
 
         if ($decision === 'block') {
@@ -1235,7 +1700,7 @@ class ChargeGuard_Dynamic_Firewall {
         error_log('ChargeGuard checkout evaluated — pre_order_id: ' . $this->pre_order_id . ', decision: ' . (isset($result['decision']) ? $result['decision'] : 'unknown'));
 
         $decision = isset($result['decision']) ? $result['decision'] : '';
-        $blocked_reason = $result['blocked_reason'] ?? $result['reason'] ?? '';
+                $blocked_reason = $result['blocked_reason'] ?? $result['reason'] ?? '';
         $limited_scoring = !empty($result['limitedScoring']);
 
         // Quota-exhausted orders come back as decision: 'approve' — the
@@ -1253,6 +1718,14 @@ class ChargeGuard_Dynamic_Firewall {
         } elseif ($limited_scoring) {
             $this->notify_admin_quota_exceeded('limited_scoring');
         }
+
+        // note: 'challenge' decisions are intentionally not handled on this
+        // classic-checkout path — deferred by design (see the otp-challenge
+        // design discussion: this store is blocks-only, so a classic
+        // implementation cannot be verified against real behavior here).
+        // a 'challenge' decision simply falls through unhandled below,
+        // identical to today's behavior for any decision value other than
+        // 'block' — i.e. the order proceeds normally, un-challenged.
 
         // حظر الطلب إذا كان القرار "block" لأسباب فعلية غير الكوتا
         if ($decision === 'block') {

@@ -1,2 +1,10 @@
 
 vendor/
+
+.env
+.env.*
+wp-config.php
+*.key
+*.pem
+debug.log
+*.log

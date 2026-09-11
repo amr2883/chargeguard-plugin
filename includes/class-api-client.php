@@ -1136,6 +1136,120 @@ class ChargeGuard_API_Client {
     }
 
     /**
+     * Requests an email OTP for the graduated 'challenge' step-up tier
+     * (see routes/risk.js's /evaluate section 1c-ii and
+     * globalRotationDetector.js). Goes through request_with_breaker() like
+     * evaluate_risk()/mint_device_token() — this sits on the live checkout
+     * path, not a one-off startup check like self_test()/reconcile_order().
+     *
+     * @param string $device_fp Untrusted, client-supplied — see the trust-boundary warning in class-dynamic-firewall.php.
+     * @param string $email
+     * @return array|WP_Error Decoded body (includes 'emailSent', 'expiresInSeconds') on success, WP_Error on failure/unreachable.
+     */
+    public function request_challenge($device_fp, $email) {
+        $endpoint  = '/risk/challenge/request';
+        $url       = $this->base_url . $endpoint;
+        $body      = json_encode([
+            'deviceFingerprint' => $device_fp,
+            'email'             => $email,
+        ]);
+        $timestamp = (string) time();
+        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+
+        $args = [
+            'method'  => 'POST',
+            'headers' => [
+                'Content-Type'              => 'application/json',
+                'X-API-Key'                 => $this->api_key,
+                'X-Store-Domain'            => wp_parse_url( home_url(), PHP_URL_HOST ),
+                'X-ChargeGuard-Signature'   => $signature,
+                'X-ChargeGuard-Timestamp'   => $timestamp,
+            ],
+            'body'    => $body,
+            // Slightly above the backend's own ~2-attempt/3s email-retry
+            // budget (see sendChallengeOtpEmail's RETRIES comment) so this
+            // request isn't cut off by our own HTTP timeout before the
+            // backend has finished trying to send.
+            'timeout' => 8,
+        ];
+
+        $response = $this->request_with_breaker($url, $args);
+
+        if (is_wp_error($response)) {
+            return $response;
+        }
+
+        $code         = wp_remote_retrieve_response_code($response);
+        $body_decoded = json_decode(wp_remote_retrieve_body($response), true);
+
+        if ($code >= 200 && $code < 300) {
+            return $body_decoded; // { success, emailSent, expiresInSeconds }
+        }
+        return new WP_Error('api_error', $body_decoded['error'] ?? 'Failed to request verification code.');
+    }
+
+    /**
+     * Verifies an OTP code for the graduated 'challenge' tier. On success,
+     * the backend mints and returns a signed 24h challenge ticket (see
+     * deviceToken.js's mintChallengeTicket) that the caller should store
+     * as the chargeguard_ct HttpOnly cookie.
+     *
+     * Mirrors evaluate_risk()'s 403-with-decision pattern: a 400 response
+     * with a `verified` key present is an INTENTIONAL, checked outcome
+     * (wrong/expired code, or too-many-attempts) — not an API failure —
+     * so it is returned as a normal array, not collapsed into a WP_Error.
+     * Collapsing it would make "the code was actually wrong" indistinguishable
+     * from "the backend is unreachable," which the caller needs to tell apart
+     * to decide whether to fail open or show the customer an actionable message.
+     *
+     * @param string $code
+     * @param string $device_fp
+     * @param string $email
+     * @return array|WP_Error {verified: bool, ticket?: string, error?: string} on any answered response, WP_Error only on genuine network/backend failure.
+     */
+    public function verify_challenge($code, $device_fp, $email) {
+        $endpoint  = '/risk/challenge/verify';
+        $url       = $this->base_url . $endpoint;
+        $body      = json_encode([
+            'code'              => $code,
+            'deviceFingerprint' => $device_fp,
+            'email'             => $email,
+        ]);
+        $timestamp = (string) time();
+        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+
+        $args = [
+            'method'  => 'POST',
+            'headers' => [
+                'Content-Type'              => 'application/json',
+                'X-API-Key'                 => $this->api_key,
+                'X-Store-Domain'            => wp_parse_url( home_url(), PHP_URL_HOST ),
+                'X-ChargeGuard-Signature'   => $signature,
+                'X-ChargeGuard-Timestamp'   => $timestamp,
+            ],
+            'body'    => $body,
+            'timeout' => 6,
+        ];
+
+        $response = $this->request_with_breaker($url, $args);
+
+        if (is_wp_error($response)) {
+            return $response;
+        }
+
+        $body_decoded = json_decode(wp_remote_retrieve_body($response), true);
+
+        // Any response carrying a 'verified' key (true or false) is an
+        // answered, intentional result — including 400 (wrong code) and
+        // 429 (too many attempts). Only a response with NEITHER a 2xx
+        // status NOR a 'verified' key is a genuine API failure.
+        if (is_array($body_decoded) && array_key_exists('verified', $body_decoded)) {
+            return $body_decoded;
+        }
+        return new WP_Error('api_error', $body_decoded['error'] ?? 'Verification failed.');
+    }
+
+    /**
      * توليد توقيع HMAC-SHA256 مطابق لتوقيع WooCommerce webhook.
      *
      * @param string $raw_body الجسم الخام للطلب.
