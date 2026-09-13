@@ -92,28 +92,28 @@ composer.lock
 # Stripe PHP SDK ??? exclude packaging/CI/doc metadata by exact
 # top-level filename, never by wildcarding the data/ directory,
 # so the CA bundle below is never at risk from a broader pattern.
-vendor/stripe-php/.git
-vendor/stripe-php/.gitignore
-vendor/stripe-php/.gitattributes
-vendor/stripe-php/.github
-vendor/stripe-php/.styleci.yml
-vendor/stripe-php/.php-cs-fixer.dist.php
-vendor/stripe-php/CHANGELOG.md
-vendor/stripe-php/README.md
-vendor/stripe-php/UPGRADING.md
-vendor/stripe-php/LICENSE
-vendor/stripe-php/OPENAPI_VERSION
-vendor/stripe-php/VERSION
-vendor/stripe-php/composer.json
-vendor/stripe-php/phpunit.xml.dist
-vendor/stripe-php/phpunit.xml
-vendor/stripe-php/build
-vendor/stripe-php/bin
-vendor/stripe-php/tests
+vendor/stripe/stripe-php/.git
+vendor/stripe/stripe-php/.gitignore
+vendor/stripe/stripe-php/.gitattributes
+vendor/stripe/stripe-php/.github
+vendor/stripe/stripe-php/.styleci.yml
+vendor/stripe/stripe-php/.php-cs-fixer.dist.php
+vendor/stripe/stripe-php/CHANGELOG.md
+vendor/stripe/stripe-php/README.md
+vendor/stripe/stripe-php/UPGRADING.md
+vendor/stripe/stripe-php/LICENSE
+vendor/stripe/stripe-php/OPENAPI_VERSION
+vendor/stripe/stripe-php/VERSION
+vendor/stripe/stripe-php/composer.json
+vendor/stripe/stripe-php/phpunit.xml.dist
+vendor/stripe/stripe-php/phpunit.xml
+vendor/stripe/stripe-php/build
+vendor/stripe/stripe-php/bin
+vendor/stripe/stripe-php/tests
 
 # Explicitly re-include the CA bundle the SDK needs at runtime,
 # in case any broader rule above would otherwise have matched it.
-!vendor/stripe-php/data
-!vendor/stripe-php/data/ca-certificates.crt
-!vendor/stripe-php/init.php
-!vendor/stripe-php/lib
+!vendor/stripe/stripe-php/data
+!vendor/stripe/stripe-php/data/ca-certificates.crt
+!vendor/stripe/stripe-php/init.php
+!vendor/stripe/stripe-php/lib

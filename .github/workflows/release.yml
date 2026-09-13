@@ -2,7 +2,7 @@ name: Build and Release Plugin ZIP
 permissions:
   contents: write
 
-# يُشغَّل تلقائياً عند دفع أي تاج يبدأ بـ v (مثال: v1.0.14)، أو يدوياً من تبويب Actions
+# يُشغَّل تلقائيًا عند دفع أي تاج يبدأ بـ v (مثال: v1.0.25)، أو يدويًا من تبويب Actions
 on:
   push:
     tags:
@@ -13,7 +13,7 @@ jobs:
   build-and-release:
     # الأهم: ubuntu-latest وليس windows-latest — هذا هو الإصلاح الجذري.
     # كل عمليات الضغط تتم هنا بأداة zip الأصلية على Linux، التي تستخدم
-    # الفاصل / حصرياً في كل مدخل داخل الأرشيف، مطابقةً تماماً لبيئة
+    # الفاصل / صحيحًا في كل مدخل داخل الأرشيف، مطابقة تمامًا لبيئة
     # التشغيل الفعلية (خوادم ووردبريس تعمل على Linux).
     runs-on: ubuntu-latest
 
@@ -37,22 +37,39 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Detected plugin version: $VERSION"
 
-      - name: Build clean plugin folder (staging)
+      - name: Build clean plugin folder (staging) from .distignore — single source of truth
         run: |
           mkdir -p build/chargeguard
-          # انسخ فقط ما يحتاجه التاجر فعلياً في الإنتاج.
-          # عدّل هذه القائمة لتطابق بنية مستودعك بالضبط.
+          # نفس منطق build.ps1 بالظبط: نمرّ على .distignore مرة واحدة
+          # ونفصل الأسطر لنوعين — أنماط استبعاد عادية، وأنماط إعادة
+          # إدراج تبدأ بـ "!". ترتيب rsync لازم يكون include أولاً ثم
+          # exclude، حتى تفوز إعادة الإدراج في حال وجود أي تعارض.
+          # هذا يحل محل القائمة اليدوية القديمة التي كانت منفصلة عن
+          # .distignore وتسببت في تسريب build.ps1 وملفات Stripe الزائدة
+          # إلى أرشيف الإصدار المنشور فعليًا.
+          INCLUDE_ARGS=()
+          EXCLUDE_ARGS=()
+          while IFS= read -r raw_line; do
+            line="$(echo "$raw_line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ -z "$line" ] && continue
+            case "$line" in
+              \#*) continue ;;
+            esac
+            case "$line" in
+              !*) INCLUDE_ARGS+=(--include="${line#!}") ;;
+              *)  EXCLUDE_ARGS+=(--exclude="$line") ;;
+            esac
+          done < .distignore
+
+          echo "عدد أنماط include: ${#INCLUDE_ARGS[@]}"
+          echo "عدد أنماط exclude: ${#EXCLUDE_ARGS[@]}"
+
           rsync -av \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='tests' \
-            --exclude='phpunit.xml' \
-            --exclude='composer.lock' \
-            --exclude='.gitignore' \
-            --exclude='.distignore' \
-            --exclude='node_modules' \
+            "${INCLUDE_ARGS[@]}" \
+            "${EXCLUDE_ARGS[@]}" \
             --exclude='build' \
             ./ build/chargeguard/
+
       - name: Strip BOM from all PHP files (safety net)
         working-directory: build/chargeguard
         run: |
@@ -76,7 +93,7 @@ jobs:
           zip -r chargeguard.zip chargeguard -x '*.DS_Store'
 
       - name: Verify no backslash-named entries exist in the ZIP
-        # هذه الخطوة تفشل الـ build بالكامل ولا تسمح بنشر أي إصدار
+        # هذه الخطوة تفشل البناء بالكامل ولا تسمح بنشر أي إصدار
         # يحتوي هذا الخلل مستقبلاً، بغض النظر عن كيفية بنائه.
         working-directory: build
         run: |
@@ -114,13 +131,40 @@ jobs:
           fi
           echo "✅ كل الملفات الحرجة موجودة."
 
+      - name: Verify no forbidden dev/build files leaked into the ZIP
+        # فحص أمان إضافي مستقل عن .distignore نفسه: حتى لو .distignore
+        # عُدّل بشكل خاطئ مستقبلاً، هذه القائمة الثابتة تفشل البناء
+        # بدلاً من نشر ملفات تطوير عن طريق الخطأ — نفس فلسفة الفحص
+        # النهائي الموجود في build.ps1 المحلي.
+        working-directory: build
+        run: |
+          FORBIDDEN=(
+            "build.ps1" "build.sh" ".distignore" ".git" ".github"
+            "phpunit.xml" "phpunit.xml.dist" "composer.lock" "node_modules"
+            ".idea" ".vscode" "tests" "test"
+          )
+          FOUND=0
+          for pattern in "${FORBIDDEN[@]}"; do
+            HIT=$(unzip -l chargeguard.zip | awk '{print $4}' | grep -F "$pattern" || true)
+            if [ -n "$HIT" ]; then
+              echo "❌ ملف/مجلد ممنوع موجود داخل الأرشيف: $pattern"
+              echo "$HIT"
+              FOUND=1
+            fi
+          done
+          if [ "$FOUND" -eq 1 ]; then
+            echo "فشل التحقق — ملفات تطوير متسربة داخل أرشيف الإصدار."
+            exit 1
+          fi
+          echo "✅ لا توجد ملفات تطوير متسربة."
+
       - name: Smoke-test the ZIP on a real WordPress + WooCommerce container
         run: |
           docker run -d --name wp-smoke-test -p 8099:80 \
             -e WORDPRESS_DB_HOST=127.0.0.1 wordpress:latest || true
-          # ملاحظة: هذه خطوة اختيارية للتوسع لاحقاً (تشغيل تثبيت وتفعيل
+          # ملاحظة: هذه خطوة اختيارية للتوسع لاحقًا (تشغيل تثبيت وتفعيل
           # فعليين عبر wp-cli داخل الـ runner قبل النشر). يمكن تفعيلها
-          # لاحقاً كطبقة حماية إضافية إن رغبتم في تشديد المراجعة أكثر.
+          # لاحقًا كطبقة حماية إضافية إن رغبتم في تشديد المراجعة أكثر.
         continue-on-error: true
 
       - name: Upload ZIP as workflow artifact (for manual inspection)
