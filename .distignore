@@ -117,3 +117,5 @@ vendor/stripe/stripe-php/tests
 !vendor/stripe/stripe-php/data/ca-certificates.crt
 !vendor/stripe/stripe-php/init.php
 !vendor/stripe/stripe-php/lib
+
+build-verify.ps1
