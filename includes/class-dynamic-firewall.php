@@ -1,4 +1,4 @@
-﻿<?php
+<?php
 /**
  * ChargeGuard - Dynamic Firewall
  *
