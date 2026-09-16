@@ -117,7 +117,11 @@ try {
             }
 
             if ((Get-Item $srcPath).PSIsContainer) {
-                Copy-Item -Path $srcPath -Destination $dstPath -Recurse -Force
+                if (-not (Test-Path $dstPath)) {
+                    New-Item -ItemType Directory -Path $dstPath -Force | Out-Null
+                }
+                $proc2 = Start-Process -FilePath "robocopy" -ArgumentList @($srcPath, $dstPath, "/E", "/NFL", "/NDL", "/NJH", "/NJS") -NoNewWindow -Wait -PassThru
+                if ($proc2.ExitCode -ge 8) { Fail "robocopy failed while restoring: $relPath" }
             } else {
                 Copy-Item -Path $srcPath -Destination $dstPath -Force
             }
@@ -126,9 +130,9 @@ try {
     }
 
     Write-Step "Verifying Stripe CA bundle is present"
-    $caBundle = Join-Path $StagingDir "vendor\stripe-php\data\ca-certificates.crt"
+    $caBundle = Join-Path $StagingDir "vendor\stripe\stripe-php\data\ca-certificates.crt"
     if (-not (Test-Path $caBundle)) {
-        Fail "vendor/stripe-php/data/ca-certificates.crt is missing from staged output. Stripe HTTPS calls would fail at runtime. Check .distignore for an over-broad data exclusion."
+        Fail "vendor/stripe/stripe-php/data/ca-certificates.crt is missing from staged output. Stripe HTTPS calls would fail at runtime. Check .distignore for an over-broad data exclusion."
     }
 
     Write-Step "Scanning staged output for forbidden files"
@@ -158,7 +162,7 @@ try {
     # ── Final cleanup: remove Stripe SDK doc/metadata files that
     # robocopy may not have excluded, so the release ZIP stays lean.
     Write-Step "Removing Stripe SDK documentation files"
-    $stripeRoot = Join-Path $StagingDir "vendor\stripe-php"
+    $stripeRoot = Join-Path $StagingDir "vendor\stripe\stripe-php"
     if (Test-Path $stripeRoot) {
         @("CHANGELOG.md","README.md","composer.json","LICENSE","OPENAPI_VERSION","VERSION","phpunit.xml.dist") | ForEach-Object {
             $path = Join-Path $stripeRoot $_
