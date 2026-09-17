@@ -2,7 +2,7 @@
 /**
  * Plugin Name: ChargeGuard for WooCommerce
  * Description: Advanced Card Testing prevention powered by ChargeGuard intelligence.
- * Version:     1.0.27
+ * Version:     1.0.28
  * Author:      ChargeGuard
  * Author URI:  https://chargeguard.io
  * License:     GPLv2 or later
