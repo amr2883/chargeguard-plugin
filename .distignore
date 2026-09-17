@@ -121,3 +121,6 @@ vendor/stripe/stripe-php/tests
 build-verify.ps1
 
 *.csv
+
+release-chargeguard.ps1
+SETUP.md
