@@ -158,7 +158,7 @@ trait ChargeGuard_Auto_Block_Trait {
         // whether the Stripe SDK was already loaded/keyed earlier in this
         // request (it always is, on the real Stripe webhook path).
         if ( ! class_exists( '\Stripe\Refund' ) ) {
-            $stripe_init = __DIR__ . '/../vendor/stripe-php/init.php';
+            $stripe_init = __DIR__ . '/../vendor/stripe/stripe-php/init.php';
             if ( ! file_exists( $stripe_init ) ) {
                 error_log( '[ChargeGuard] Auto-refund FAILED for order ' . $order->get_id() . ': Stripe SDK not installed.' );
                 $order->add_order_note( __( 'ChargeGuard auto-refund FAILED: Stripe SDK not installed.', 'chargeguard-woocommerce' ) );

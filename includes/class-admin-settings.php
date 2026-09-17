@@ -1645,7 +1645,7 @@ class ChargeGuard_Admin_Settings {
             wp_send_json_error( [ 'message' => 'Please save your Stripe secret key first.' ] );
         }
 
-        $stripe_init = __DIR__ . '/../vendor/stripe-php/init.php';
+        $stripe_init = __DIR__ . '/../vendor/stripe/stripe-php/init.php';
         if ( ! file_exists( $stripe_init ) ) {
             wp_send_json_error( [ 'message' => 'Stripe SDK not installed. Run composer install.' ] );
         }
