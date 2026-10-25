@@ -67,7 +67,7 @@ if ($currentBranch -ne "main") {
     Fail "انت مش على main (انت على $currentBranch). اعمل checkout main الأول."
 }
 
-git -C $RepoPath fetch origin main 2>&1 | Out-Null
+$null = git -C $RepoPath fetch --quiet origin main 2>&1
 $localHead  = git -C $RepoPath rev-parse HEAD
 $remoteHead = git -C $RepoPath rev-parse origin/main
 
