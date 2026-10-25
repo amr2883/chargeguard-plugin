@@ -174,7 +174,29 @@ try {
     if (Test-Path $OutputZip) {
         Remove-Item $OutputZip -Force
     }
-    Compress-Archive -Path $StagingDir -DestinationPath $OutputZip -CompressionLevel Optimal
+    # Build the zip entry-by-entry so entry names always use '/' (ZIP spec).
+# Compress-Archive on PS 5.1 writes '\' which breaks WordPress ZipArchive.
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+$stagingParent = Split-Path $StagingDir -Parent
+$zipStream = [System.IO.File]::Open($OutputZip, [System.IO.FileMode]::Create)
+try {
+    $archive = New-Object System.IO.Compression.ZipArchive($zipStream, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        Get-ChildItem -Path $StagingDir -Recurse -File | ForEach-Object {
+            $rel = $_.FullName.Substring($stagingParent.Length + 1) -replace '\\', '/'
+            [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $archive, $_.FullName, $rel, [System.IO.Compression.CompressionLevel]::Optimal)
+        }
+    } finally { $archive.Dispose() }
+} finally { $zipStream.Dispose() }
+
+# Guard: fail the build if any backslash path sneaks back in.
+$chk = [System.IO.Compression.ZipFile]::OpenRead($OutputZip)
+try {
+    if ($chk.Entries | Where-Object { $_.FullName -match '\\' }) { throw "ZIP contains backslash paths" }
+} finally { $chk.Dispose() }
 
     $zipInfo = Get-Item $OutputZip
     $fileCount = (Get-ChildItem -Path $StagingDir -Recurse -File).Count

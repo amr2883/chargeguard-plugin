@@ -134,7 +134,7 @@ class ChargeGuard_API_Client {
      *                        'chargeguard_circuit_open' WP_Error if the
      *                        breaker is currently open.
      */
-    private function request_with_breaker($url, $args) {
+    private function request_with_breaker($url, $method, $raw_body, $timeout) {
         if ($this->is_circuit_open()) {
             // NOTE: this error no longer implies "fail open" by itself.
             // What happens next is decided by the caller — see
@@ -148,11 +148,28 @@ class ChargeGuard_API_Client {
             );
         }
 
-        $response = wp_remote_post($url, $args);
+        // request_id بيتولّد مرة واحدة بس هنا، للنداء المنطقي كله (المحاولة
+        // الأولى + أي retry). لازم يفضل ثابت عبر كل المحاولات الفعلية —
+        // شوف الشرح في generate_hmac() فوق ليه ده أساسي لمنع الـ backend من
+        // تنفيذ نفس العملية مرتين أو رفض retry شرعي بالغلط.
+        $request_id = wp_generate_uuid4();
+
+        $attempt = function () use ($url, $method, $raw_body, $timeout, $request_id) {
+            $headers = $this->build_signed_headers($raw_body, $request_id, $method, $url);
+            return wp_remote_request($url, [
+                'method'  => $method,
+                'headers' => $headers,
+                'body'    => $raw_body,
+                'timeout' => $timeout,
+            ]);
+        };
+
+        $response = $attempt();
 
         // Single immediate retry (no sleep) on network failure or 5xx.
+        // نفس $request_id، لكن timestamp/signature جداد تمامًا للمحاولة دي.
         if (is_wp_error($response) || wp_remote_retrieve_response_code($response) >= 500) {
-            $response = wp_remote_post($url, $args);
+            $response = $attempt();
         }
 
         if (is_wp_error($response) || wp_remote_retrieve_response_code($response) >= 500) {
@@ -173,24 +190,9 @@ class ChargeGuard_API_Client {
     public function send_enrich($data) {
         $endpoint = '/risk/enrich';
         $url      = $this->base_url . $endpoint;
-        $body      = json_encode($data);
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+        $body     = json_encode($data);
 
-        $args = [
-            'method'  => 'POST',
-            'headers' => [
-                'Content-Type'              => 'application/json',
-                'X-API-Key'                 => $this->api_key,
-                'X-Store-Domain'            => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature'   => $signature,
-                'X-ChargeGuard-Timestamp'   => $timestamp,
-            ],
-            'body'    => $body,
-            'timeout' => 5,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        $response = $this->request_with_breaker($url, 'POST', $body, 5);
 
         if (is_wp_error($response)) {
             return $response;
@@ -217,28 +219,10 @@ class ChargeGuard_API_Client {
      * @return array|WP_Error Decoded body (['ranges' => [...]]), or WP_Error.
      */
     public function get_cloudflare_ranges() {
-        $endpoint  = '/risk/cloudflare-ranges';
-        $url       = $this->base_url . $endpoint;
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac('', $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+        $endpoint = '/risk/cloudflare-ranges';
+        $url      = $this->base_url . $endpoint;
 
-        $args = [
-            'method'  => 'GET',
-            'headers' => [
-                // Required even for this bodyless GET — see whitelist_get()
-                // below for why (the backend's express.raw() body-capture
-                // middleware only runs, and thus only makes the signed
-                // empty-string body verifiable, when this header is set).
-                'Content-Type'            => 'application/json',
-                'X-API-Key'               => $this->api_key,
-                'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature' => $signature,
-                'X-ChargeGuard-Timestamp' => $timestamp,
-            ],
-            'timeout' => 10,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        $response = $this->request_with_breaker($url, 'GET', '', 10);
 
         if (is_wp_error($response)) {
             return $response;
@@ -262,24 +246,9 @@ class ChargeGuard_API_Client {
     public function check_device($fingerprint) {
         $endpoint = '/risk/check-device';
         $url      = $this->base_url . $endpoint;
-        $body      = json_encode(['fingerprint' => $fingerprint]);
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+        $body     = json_encode(['fingerprint' => $fingerprint]);
 
-        $args = [
-            'method'  => 'POST',
-            'headers' => [
-                'Content-Type'              => 'application/json',
-                'X-API-Key'                 => $this->api_key,
-                'X-Store-Domain'            => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature'   => $signature,
-                'X-ChargeGuard-Timestamp'   => $timestamp,
-            ],
-            'body'    => $body,
-            'timeout' => 3,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        $response = $this->request_with_breaker($url, 'POST', $body, 3);
 
         if (is_wp_error($response)) {
             return $response;
@@ -315,21 +284,14 @@ class ChargeGuard_API_Client {
 
         $endpoint = '/risk/blocked-attempt';
         $url      = $this->base_url . $endpoint;
-        $body      = json_encode($data);
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+        $body     = json_encode($data);
+        $headers  = $this->build_signed_headers($body, wp_generate_uuid4(), 'POST', $url);
 
         wp_remote_post($url, [
             'method'   => 'POST',
             'blocking' => false,
             'timeout'  => 3,
-            'headers'  => [
-                'Content-Type'              => 'application/json',
-                'X-API-Key'                 => $this->api_key,
-                'X-Store-Domain'            => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature'   => $signature,
-                'X-ChargeGuard-Timestamp'   => $timestamp,
-            ],
+            'headers'  => $headers,
             'body'     => $body,
         ]);
     }
@@ -344,27 +306,12 @@ class ChargeGuard_API_Client {
     public function send_feedback($order_id, $is_fraud) {
         $endpoint = '/risk/feedback';
         $url      = $this->base_url . $endpoint;
-        $body      = json_encode([
-            'orderId'  => (string) $order_id,
-            'isFraud'  => (bool) $is_fraud,
+        $body     = json_encode([
+            'orderId' => (string) $order_id,
+            'isFraud' => (bool) $is_fraud,
         ]);
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
 
-        $args = [
-            'method'  => 'POST',
-            'headers' => [
-                'Content-Type'              => 'application/json',
-                'X-API-Key'                 => $this->api_key,
-                'X-Store-Domain'            => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature'   => $signature,
-                'X-ChargeGuard-Timestamp'   => $timestamp,
-            ],
-            'body'    => $body,
-            'timeout' => 5,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        $response = $this->request_with_breaker($url, 'POST', $body, 5);
 
         if (is_wp_error($response)) {
             return $response;
@@ -386,35 +333,13 @@ class ChargeGuard_API_Client {
      * @return array|WP_Error Decoded response body, or WP_Error on failure.
      */
     public function whitelist_get() {
-        $endpoint  = '/risk/whitelist';
-        $url       = $this->base_url . $endpoint;
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac('', $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+        $endpoint = '/risk/whitelist';
+        $url      = $this->base_url . $endpoint;
 
-        $args = [
-            'method'  => 'GET',
-            'headers' => [
-                // Content-Type is required here even though there's no body:
-                // the backend's Express app registers express.raw({ type:
-                // 'application/json' }) on this exact path (app.js), and
-                // that middleware only captures the (empty) body into a
-                // Buffer when this header is present — which is what makes
-                // the signed-empty-string body below match what the
-                // backend's HMAC middleware computes. Without it, the
-                // backend sees no parsed body at all and cannot verify
-                // this signature. Mirrors whitelist_delete()/
-                // blacklist_delete(), which already send this header on
-                // their own bodyless requests for the identical reason.
-                'Content-Type'            => 'application/json',
-                'X-API-Key'               => $this->api_key,
-                'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature' => $signature,
-                'X-ChargeGuard-Timestamp' => $timestamp,
-            ],
-            'timeout' => 15,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        // Content-Type بيتضاف تلقائيًا جوه build_signed_headers() دلوقتي —
+        // مفيش حاجة تفوّتها تاني حتى لو GET من غير body (زي ما كان بيحصل
+        // قبل كده في stores_get/webhook_status/geo_overrides_get).
+        $response = $this->request_with_breaker($url, 'GET', '', 15);
 
         if (is_wp_error($response)) {
             return $response;
@@ -438,31 +363,16 @@ class ChargeGuard_API_Client {
      * @return array|WP_Error
      */
     public function whitelist_add($type, $value, $reason = '') {
-        $endpoint  = '/risk/whitelist';
-        $url       = $this->base_url . $endpoint;
-        $body      = json_encode([
+        $endpoint = '/risk/whitelist';
+        $url      = $this->base_url . $endpoint;
+        $body     = json_encode([
             'type'      => $type,
             'value'     => $value,
             'reason'    => $reason ?: null,
             'createdBy' => get_option('chargeguard_connected_email'),
         ]);
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
 
-        $args = [
-            'method'  => 'POST',
-            'headers' => [
-                'Content-Type'            => 'application/json',
-                'X-API-Key'               => $this->api_key,
-                'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature' => $signature,
-                'X-ChargeGuard-Timestamp' => $timestamp,
-            ],
-            'body'    => $body,
-            'timeout' => 15,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        $response = $this->request_with_breaker($url, 'POST', $body, 15);
 
         if (is_wp_error($response)) {
             return $response;
@@ -487,25 +397,10 @@ class ChargeGuard_API_Client {
      * @return true|WP_Error
      */
     public function whitelist_delete($id) {
-        $endpoint  = '/risk/whitelist/' . rawurlencode($id);
-        $url       = $this->base_url . $endpoint;
-        $body      = '';
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+        $endpoint = '/risk/whitelist/' . rawurlencode($id);
+        $url      = $this->base_url . $endpoint;
 
-        $args = [
-            'method'  => 'DELETE',
-            'headers' => [
-                'Content-Type'            => 'application/json',
-                'X-API-Key'               => $this->api_key,
-                'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature' => $signature,
-                'X-ChargeGuard-Timestamp' => $timestamp,
-            ],
-            'timeout' => 15,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        $response = $this->request_with_breaker($url, 'DELETE', '', 15);
 
         if (is_wp_error($response)) {
             return $response;
@@ -525,26 +420,10 @@ class ChargeGuard_API_Client {
      * @return array|WP_Error
      */
     public function blacklist_get() {
-        $endpoint  = '/risk/blacklist';
-        $url       = $this->base_url . $endpoint;
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac('', $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+        $endpoint = '/risk/blacklist';
+        $url      = $this->base_url . $endpoint;
 
-        $args = [
-            'method'  => 'GET',
-            'headers' => [
-                // See whitelist_get() above for why this header is required
-                // on an otherwise-bodyless GET request.
-                'Content-Type'            => 'application/json',
-                'X-API-Key'               => $this->api_key,
-                'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature' => $signature,
-                'X-ChargeGuard-Timestamp' => $timestamp,
-            ],
-            'timeout' => 15,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        $response = $this->request_with_breaker($url, 'GET', '', 15);
 
         if (is_wp_error($response)) {
             return $response;
@@ -568,31 +447,16 @@ class ChargeGuard_API_Client {
      * @return array|WP_Error
      */
     public function blacklist_add($type, $value, $reason = '') {
-        $endpoint  = '/risk/blacklist';
-        $url       = $this->base_url . $endpoint;
-        $body      = json_encode([
+        $endpoint = '/risk/blacklist';
+        $url      = $this->base_url . $endpoint;
+        $body     = json_encode([
             'type'      => $type,
             'value'     => $value,
             'reason'    => $reason ?: null,
             'createdBy' => get_option('chargeguard_connected_email'),
         ]);
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
 
-        $args = [
-            'method'  => 'POST',
-            'headers' => [
-                'Content-Type'            => 'application/json',
-                'X-API-Key'               => $this->api_key,
-                'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature' => $signature,
-                'X-ChargeGuard-Timestamp' => $timestamp,
-            ],
-            'body'    => $body,
-            'timeout' => 15,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        $response = $this->request_with_breaker($url, 'POST', $body, 15);
 
         if (is_wp_error($response)) {
             return $response;
@@ -614,25 +478,10 @@ class ChargeGuard_API_Client {
      * @return true|WP_Error
      */
     public function blacklist_delete($id) {
-        $endpoint  = '/risk/blacklist/' . rawurlencode($id);
-        $url       = $this->base_url . $endpoint;
-        $body      = '';
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+        $endpoint = '/risk/blacklist/' . rawurlencode($id);
+        $url      = $this->base_url . $endpoint;
 
-        $args = [
-            'method'  => 'DELETE',
-            'headers' => [
-                'Content-Type'            => 'application/json',
-                'X-API-Key'               => $this->api_key,
-                'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature' => $signature,
-                'X-ChargeGuard-Timestamp' => $timestamp,
-            ],
-            'timeout' => 15,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        $response = $this->request_with_breaker($url, 'DELETE', '', 15);
 
         if (is_wp_error($response)) {
             return $response;
@@ -653,31 +502,12 @@ class ChargeGuard_API_Client {
      * @return array|WP_Error
      */
     public function stores_get() {
-        $endpoint  = '/stores';
-        $url       = $this->base_url . $endpoint;
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac('', $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+        $endpoint = '/stores';
+        $url      = $this->base_url . $endpoint;
 
-        $args = [
-            'method'  => 'GET',
-            'headers' => [
-                // Required even for this bodyless GET — see whitelist_get()
-                // for why (the backend's express.raw() body-capture
-                // middleware only runs, and thus only makes the signed
-                // empty-string body verifiable, when this header is set).
-                // BUG FIX: this header was previously missing here, causing
-                // every call to this method to fail HMAC verification on
-                // the backend (signed empty string vs. reconstructed '{}').
-                'Content-Type'            => 'application/json',
-                'X-API-Key'               => $this->api_key,
-                'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature' => $signature,
-                'X-ChargeGuard-Timestamp' => $timestamp,
-            ],
-            'timeout' => 15,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        // BUG FIX التاريخي (كان الـ Content-Type بينسى هنا) اتحل دلوقتي
+        // بشكل بنيوي — كل method بقى بيمر إجباريًا من build_signed_headers().
+        $response = $this->request_with_breaker($url, 'GET', '', 15);
 
         if (is_wp_error($response)) {
             return $response;
@@ -703,29 +533,14 @@ class ChargeGuard_API_Client {
      * @return array|WP_Error
      */
     public function store_add($store_url, $label = '') {
-        $endpoint  = '/stores';
-        $url       = $this->base_url . $endpoint;
-        $body      = json_encode([
+        $endpoint = '/stores';
+        $url      = $this->base_url . $endpoint;
+        $body     = json_encode([
             'storeUrl' => $store_url,
             'label'    => $label ?: null,
         ]);
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
 
-        $args = [
-            'method'  => 'POST',
-            'headers' => [
-                'Content-Type'            => 'application/json',
-                'X-API-Key'               => $this->api_key,
-                'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature' => $signature,
-                'X-ChargeGuard-Timestamp' => $timestamp,
-            ],
-            'body'    => $body,
-            'timeout' => 15,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        $response = $this->request_with_breaker($url, 'POST', $body, 15);
 
         if (is_wp_error($response)) {
             return $response;
@@ -755,26 +570,11 @@ class ChargeGuard_API_Client {
      * @return array|WP_Error
      */
     public function store_update($id, $data) {
-        $endpoint  = '/stores/' . rawurlencode($id);
-        $url       = $this->base_url . $endpoint;
-        $body      = json_encode($data);
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+        $endpoint = '/stores/' . rawurlencode($id);
+        $url      = $this->base_url . $endpoint;
+        $body     = json_encode($data);
 
-        $args = [
-            'method'  => 'PUT',
-            'headers' => [
-                'Content-Type'            => 'application/json',
-                'X-API-Key'               => $this->api_key,
-                'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature' => $signature,
-                'X-ChargeGuard-Timestamp' => $timestamp,
-            ],
-            'body'    => $body,
-            'timeout' => 15,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        $response = $this->request_with_breaker($url, 'PUT', $body, 15);
 
         if (is_wp_error($response)) {
             return $response;
@@ -796,25 +596,10 @@ class ChargeGuard_API_Client {
      * @return true|WP_Error
      */
     public function store_deactivate($id) {
-        $endpoint  = '/stores/' . rawurlencode($id);
-        $url       = $this->base_url . $endpoint;
-        $body      = '';
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+        $endpoint = '/stores/' . rawurlencode($id);
+        $url      = $this->base_url . $endpoint;
 
-        $args = [
-            'method'  => 'DELETE',
-            'headers' => [
-                'Content-Type'            => 'application/json',
-                'X-API-Key'               => $this->api_key,
-                'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature' => $signature,
-                'X-ChargeGuard-Timestamp' => $timestamp,
-            ],
-            'timeout' => 15,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        $response = $this->request_with_breaker($url, 'DELETE', '', 15);
 
         if (is_wp_error($response)) {
             return $response;
@@ -842,30 +627,15 @@ class ChargeGuard_API_Client {
      * @return array|WP_Error
      */
     public function webhook_save($url, $type, $resolved_ip = '') {
-        $endpoint  = '/settings/webhook';
-        $api_url   = $this->base_url . $endpoint;
-        $body      = json_encode([
+        $endpoint = '/settings/webhook';
+        $api_url  = $this->base_url . $endpoint;
+        $body     = json_encode([
             'webhookUrl'  => $url,
             'webhookType' => $type,
             'resolvedIp'  => $resolved_ip,
         ]);
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
 
-        $args = [
-            'method'  => 'POST',
-            'headers' => [
-                'Content-Type'            => 'application/json',
-                'X-API-Key'               => $this->api_key,
-                'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature' => $signature,
-                'X-ChargeGuard-Timestamp' => $timestamp,
-            ],
-            'body'    => $body,
-            'timeout' => 15,
-        ];
-
-        $response = $this->request_with_breaker($api_url, $args);
+        $response = $this->request_with_breaker($api_url, 'POST', $body, 15);
 
         if (is_wp_error($response)) {
             return $response;
@@ -886,26 +656,11 @@ class ChargeGuard_API_Client {
      * @return true|WP_Error
      */
     public function webhook_test() {
-        $endpoint  = '/settings/webhook/test';
-        $url       = $this->base_url . $endpoint;
-        $body      = json_encode([]);
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+        $endpoint = '/settings/webhook/test';
+        $url      = $this->base_url . $endpoint;
+        $body     = json_encode([]); // '{}' — ثابتة، مش سترينج فاضية
 
-        $args = [
-            'method'  => 'POST',
-            'headers' => [
-                'Content-Type'            => 'application/json',
-                'X-API-Key'               => $this->api_key,
-                'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature' => $signature,
-                'X-ChargeGuard-Timestamp' => $timestamp,
-            ],
-            'body'    => $body,
-            'timeout' => 15,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        $response = $this->request_with_breaker($url, 'POST', $body, 15);
 
         if (is_wp_error($response)) {
             return $response;
@@ -959,26 +714,10 @@ class ChargeGuard_API_Client {
      * @return array|WP_Error
      */
     public function webhook_status() {
-        $endpoint  = '/settings/webhook';
-        $url       = $this->base_url . $endpoint;
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac('', $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+        $endpoint = '/settings/webhook';
+        $url      = $this->base_url . $endpoint;
 
-        $args = [
-            'method'  => 'GET',
-            'headers' => [
-                // See whitelist_get() and the BUG FIX note in stores_get()
-                // above — this header was missing here too.
-                'Content-Type'            => 'application/json',
-                'X-API-Key'               => $this->api_key,
-                'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature' => $signature,
-                'X-ChargeGuard-Timestamp' => $timestamp,
-            ],
-            'timeout' => 15,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        $response = $this->request_with_breaker($url, 'GET', '', 15);
 
         if (is_wp_error($response)) {
             return $response;
@@ -999,26 +738,10 @@ class ChargeGuard_API_Client {
      * @return array|WP_Error
      */
     public function geo_overrides_get() {
-        $endpoint  = '/settings/country-overrides';
-        $url       = $this->base_url . $endpoint;
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac('', $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+        $endpoint = '/settings/country-overrides';
+        $url      = $this->base_url . $endpoint;
 
-        $args = [
-            'method'  => 'GET',
-            'headers' => [
-                // See whitelist_get() and the BUG FIX note in stores_get()
-                // above — this header was missing here too.
-                'Content-Type'            => 'application/json',
-                'X-API-Key'               => $this->api_key,
-                'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature' => $signature,
-                'X-ChargeGuard-Timestamp' => $timestamp,
-            ],
-            'timeout' => 10,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        $response = $this->request_with_breaker($url, 'GET', '', 10);
 
         if (is_wp_error($response)) {
             return $response;
@@ -1041,9 +764,9 @@ class ChargeGuard_API_Client {
      * @return array|WP_Error
      */
     public function geo_override_save($country_code, $override) {
-        $endpoint  = '/settings/country-overrides';
-        $url       = $this->base_url . $endpoint;
-        $body      = json_encode([
+        $endpoint = '/settings/country-overrides';
+        $url      = $this->base_url . $endpoint;
+        $body     = json_encode([
             'updates' => [
                 [
                     'countryCode' => strtoupper($country_code),
@@ -1051,23 +774,8 @@ class ChargeGuard_API_Client {
                 ],
             ],
         ]);
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
 
-        $args = [
-            'method'  => 'PUT',
-            'headers' => [
-                'Content-Type'            => 'application/json',
-                'X-API-Key'               => $this->api_key,
-                'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature' => $signature,
-                'X-ChargeGuard-Timestamp' => $timestamp,
-            ],
-            'body'    => $body,
-            'timeout' => 10,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        $response = $this->request_with_breaker($url, 'PUT', $body, 10);
 
         if (is_wp_error($response)) {
             return $response;
@@ -1101,26 +809,11 @@ class ChargeGuard_API_Client {
      * @return string|WP_Error The opaque token, or WP_Error on failure.
      */
     public function mint_device_token($ip = '') {
-        $endpoint  = '/risk/device-token';
-        $url       = $this->base_url . $endpoint;
-        $body      = json_encode(['ip' => $ip]);
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+        $endpoint = '/risk/device-token';
+        $url      = $this->base_url . $endpoint;
+        $body     = json_encode(['ip' => $ip]);
 
-        $args = [
-            'method'  => 'POST',
-            'headers' => [
-                'Content-Type'              => 'application/json',
-                'X-API-Key'                 => $this->api_key,
-                'X-Store-Domain'            => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature'   => $signature,
-                'X-ChargeGuard-Timestamp'   => $timestamp,
-            ],
-            'body'    => $body,
-            'timeout' => 4,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        $response = $this->request_with_breaker($url, 'POST', $body, 4);
 
         if (is_wp_error($response)) {
             return $response;
@@ -1147,33 +840,18 @@ class ChargeGuard_API_Client {
      * @return array|WP_Error Decoded body (includes 'emailSent', 'expiresInSeconds') on success, WP_Error on failure/unreachable.
      */
     public function request_challenge($device_fp, $email) {
-        $endpoint  = '/risk/challenge/request';
-        $url       = $this->base_url . $endpoint;
-        $body      = json_encode([
+        $endpoint = '/risk/challenge/request';
+        $url      = $this->base_url . $endpoint;
+        $body     = json_encode([
             'deviceFingerprint' => $device_fp,
             'email'             => $email,
         ]);
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
 
-        $args = [
-            'method'  => 'POST',
-            'headers' => [
-                'Content-Type'              => 'application/json',
-                'X-API-Key'                 => $this->api_key,
-                'X-Store-Domain'            => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature'   => $signature,
-                'X-ChargeGuard-Timestamp'   => $timestamp,
-            ],
-            'body'    => $body,
-            // Slightly above the backend's own ~2-attempt/3s email-retry
-            // budget (see sendChallengeOtpEmail's RETRIES comment) so this
-            // request isn't cut off by our own HTTP timeout before the
-            // backend has finished trying to send.
-            'timeout' => 8,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        // Slightly above the backend's own ~2-attempt/3s email-retry
+        // budget (see sendChallengeOtpEmail's RETRIES comment) so this
+        // request isn't cut off by our own HTTP timeout before the
+        // backend has finished trying to send.
+        $response = $this->request_with_breaker($url, 'POST', $body, 8);
 
         if (is_wp_error($response)) {
             return $response;
@@ -1184,6 +862,12 @@ class ChargeGuard_API_Client {
 
         if ($code >= 200 && $code < 300) {
             return $body_decoded; // { success, emailSent, expiresInSeconds }
+        }
+
+        // 429 = the backend's device/email gate answered on purpose ("slow down"). It is NOT a delivery
+        // failure, so it gets its own error code and callers must never fail open on it.
+        if ($code === 429) {
+            return new WP_Error('chargeguard_challenge_rate_limited', (is_array($body_decoded) && isset($body_decoded['error'])) ? (string) $body_decoded['error'] : 'Too many verification requests. Please wait a few minutes.');
         }
         return new WP_Error('api_error', $body_decoded['error'] ?? 'Failed to request verification code.');
     }
@@ -1208,30 +892,15 @@ class ChargeGuard_API_Client {
      * @return array|WP_Error {verified: bool, ticket?: string, error?: string} on any answered response, WP_Error only on genuine network/backend failure.
      */
     public function verify_challenge($code, $device_fp, $email) {
-        $endpoint  = '/risk/challenge/verify';
-        $url       = $this->base_url . $endpoint;
-        $body      = json_encode([
+        $endpoint = '/risk/challenge/verify';
+        $url      = $this->base_url . $endpoint;
+        $body     = json_encode([
             'code'              => $code,
             'deviceFingerprint' => $device_fp,
             'email'             => $email,
         ]);
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
 
-        $args = [
-            'method'  => 'POST',
-            'headers' => [
-                'Content-Type'              => 'application/json',
-                'X-API-Key'                 => $this->api_key,
-                'X-Store-Domain'            => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature'   => $signature,
-                'X-ChargeGuard-Timestamp'   => $timestamp,
-            ],
-            'body'    => $body,
-            'timeout' => 6,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        $response = $this->request_with_breaker($url, 'POST', $body, 6);
 
         if (is_wp_error($response)) {
             return $response;
@@ -1255,32 +924,48 @@ class ChargeGuard_API_Client {
      * @param string $raw_body الجسم الخام للطلب.
      * @return string التوقيع بصيغة base64.
      */
-    private function generate_hmac($raw_body, $timestamp, $domain) {
-        // v2: domain-bound signature. The signed string includes the store
-        // domain so a captured signature+body pair cannot be replayed under
-        // a different X-Store-Domain. The 'v2=' prefix lets the backend
-        // distinguish this from the legacy 'v1=' (timestamp.body only)
-        // format during the dual-format migration window — see backend
-        // verification middleware for the corresponding logic.
-        //
-        // On the timestamp specifically: it is included in the signed
-        // string so that the backend's signature-verification middleware
-        // is able to enforce a freshness window (e.g. rejecting any
-        // request whose X-ChargeGuard-Timestamp is more than ~5 minutes
-        // from the server's current time) and thereby reject replay of an
-        // intercepted, validly-signed request after that window has
-        // elapsed. This client only signs the timestamp — it has no
-        // ability to enforce any freshness check itself, since that
-        // requires evaluating the timestamp's age against the receiving
-        // server's clock at verification time, which only the backend can
-        // do. If the backend's middleware does not enforce a freshness
-        // window, the timestamp provides no temporal replay protection —
-        // an intercepted signature could be replayed indefinitely, though
-        // the domain- and body-binding above would still prevent that
-        // replayed request from being used against a different store or
-        // with a modified payload.
-        $signed_string = $timestamp . '.' . $domain . '.' . $raw_body;
-        return 'v2=' . hash_hmac('sha256', $signed_string, $this->webhook_secret);
+    private function generate_hmac($raw_body, $timestamp, $domain, $request_id, $method, $path) {
+        // v3: يضيف request_id صريح جوه الرسالة الموقّعة، فوق domain-binding
+        // بتاع v2. الـ request_id ده هو نفسه مفتاح الـ idempotency اللي
+        // الـ backend بيستخدمه يعرف إن ده retry لنفس العملية المنطقية —
+        // وده معناه إنه لازم يفضل ثابت مع كل retry فعلي لنفس النداء
+        // المنطقي، حتى لو الـ timestamp (وبالتالي التوقيع نفسه) اتجدّد مع
+        // كل محاولة (شوف build_signed_headers/request_with_breaker تحت).
+        // وبما إن request_id جوه السلسلة الموقّعة، مهاجم ملقطش السر
+        // مايقدرش يغيّر request_id لتوقيع ملتقط من غيره — أي تغيير فيه
+        // بيكسر التوقيع.
+        $signed_string = $timestamp . '.' . $domain . '.' . $request_id . '.' . strtoupper($method) . '.' . $path . "\n" . $raw_body;
+        return 'v3=' . hash_hmac('sha256', $signed_string, $this->webhook_secret);
+    }
+
+    /**
+     * بناء الـ headers الموقّعة كاملة لمحاولة HTTP واحدة فعلية. بتتنادى من
+     * جديد مع كل محاولة (بما فيها الـ retry) من جوه request_with_breaker() —
+     * كل محاولة بتاخد timestamp وتوقيع طازة، لكن بنفس $request_id اللي
+     * اتبعت لها (متولّد مرة واحدة بس لكل نداء منطقي)، وده اللي بيخلي الـ
+     * backend يتعامل مع الـ retry على إنه "نفس العملية" بدل ما ينفّذ
+     * handler فيه side effect مرتين، أو يرفض retry لطلب نجح فعلاً أول مرة.
+     *
+     * @param string $raw_body
+     * @param string $request_id
+     * @return array Header map جاهزة لـ wp_remote_request()'s 'headers'.
+     */
+    private function build_signed_headers($raw_body, $request_id, $method, $url) {
+        $domain    = wp_parse_url( home_url(), PHP_URL_HOST );
+        $timestamp = (string) time();
+        // Method + path exactly as sent (no query). An unparsable URL gives '' and the server rejects it.
+        $path      = wp_parse_url($url, PHP_URL_PATH);
+        $path      = is_string($path) ? $path : '';
+        $signature = $this->generate_hmac($raw_body, $timestamp, $domain, $request_id, $method, $path);
+
+        return [
+            'Content-Type'             => 'application/json',
+            'X-API-Key'                => $this->api_key,
+            'X-Store-Domain'           => $domain,
+            'X-ChargeGuard-Signature'  => $signature,
+            'X-ChargeGuard-Timestamp'  => $timestamp,
+            'X-ChargeGuard-Request-Id' => $request_id,
+        ];
     }
 
     /**
@@ -1292,24 +977,9 @@ class ChargeGuard_API_Client {
     public function evaluate_risk($data) {
         $endpoint = '/risk/evaluate';
         $url      = $this->base_url . $endpoint;
-        $body      = json_encode($data);
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+        $body     = json_encode($data);
 
-        $args = [
-            'method'  => 'POST',
-            'headers' => [
-                'Content-Type'              => 'application/json',
-                'X-API-Key'                 => $this->api_key,
-                'X-Store-Domain'            => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature'   => $signature,
-                'X-ChargeGuard-Timestamp'   => $timestamp,
-            ],
-            'body'    => $body,
-            'timeout' => 5,
-        ];
-
-        $response = $this->request_with_breaker($url, $args);
+        $response = $this->request_with_breaker($url, 'POST', $body, 5);
 
         if (is_wp_error($response)) {
             return $response;
@@ -1356,19 +1026,12 @@ class ChargeGuard_API_Client {
     public function self_test() {
         $endpoint = '/auth/self-test';
         $url      = $this->base_url . $endpoint;
-        $body      = json_encode(['check' => 'signing_secret']);
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+        $body     = json_encode(['check' => 'signing_secret']);
+        $headers  = $this->build_signed_headers($body, wp_generate_uuid4(), 'POST', $url);
 
         $response = wp_remote_post($url, [
             'method'  => 'POST',
-            'headers' => [
-                'Content-Type'            => 'application/json',
-                'X-API-Key'               => $this->api_key,
-                'X-Store-Domain'          => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature' => $signature,
-                'X-ChargeGuard-Timestamp' => $timestamp,
-            ],
+            'headers' => $headers,
             'body'    => $body,
             'timeout' => 10,
         ]);
@@ -1412,24 +1075,17 @@ class ChargeGuard_API_Client {
 
         $endpoint = '/risk/reconcile';
         $url      = $this->base_url . $endpoint;
-        $body      = json_encode([
+        $body     = json_encode([
             'preOrderId' => $pre_order_id,
             'orderId'    => (string) $real_order_id,
         ]);
-        $timestamp = (string) time();
-        $signature = $this->generate_hmac($body, $timestamp, wp_parse_url( home_url(), PHP_URL_HOST ));
+        $headers  = $this->build_signed_headers($body, wp_generate_uuid4(), 'POST', $url);
 
         $response = wp_remote_post($url, [
             'method'   => 'POST',
             'blocking' => false,
             'timeout'  => 3,
-            'headers'  => [
-                'Content-Type'              => 'application/json',
-                'X-API-Key'                 => $this->api_key,
-                'X-Store-Domain'            => wp_parse_url( home_url(), PHP_URL_HOST ),
-                'X-ChargeGuard-Signature'   => $signature,
-                'X-ChargeGuard-Timestamp'   => $timestamp,
-            ],
+            'headers'  => $headers,
             'body'     => $body,
         ]);
 

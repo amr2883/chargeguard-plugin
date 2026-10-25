@@ -298,6 +298,39 @@ register_deactivation_hook(__FILE__, function () {
     wp_clear_scheduled_hook('chargeguard_cleanup_atomic_rate_limit_buckets');
 });
 
+
+/**
+ * Self-healing re-check on every 'init', in addition to the
+ * register_activation_hook() calls above.
+ *
+ * register_activation_hook() only fires once, at the moment the plugin
+ * is activated. If any of the three scheduled events above is ever lost
+ * without an explicit deactivate/reactivate cycle — e.g. a host resets
+ * wp_options during a server migration, a stale wp_cron table gets
+ * restored from an old backup, or another plugin calls
+ * wp_clear_scheduled_hook() on one of these hooks by mistake — the
+ * event would otherwise never come back on its own, silently, with no
+ * error anywhere.
+ *
+ * Each wp_next_scheduled() guard below is identical to the one already
+ * used in the matching activation hook above, so this is provably
+ * idempotent: a no-op on every normal request where all three events
+ * are already scheduled, and it only re-schedules the specific event(s)
+ * that are actually missing.
+ */
+add_action('init', 'chargeguard_ensure_scheduled_events');
+function chargeguard_ensure_scheduled_events() {
+    if (!wp_next_scheduled('chargeguard_refresh_cf_ranges')) {
+        wp_schedule_event(time(), 'daily', 'chargeguard_refresh_cf_ranges');
+    }
+    if (!wp_next_scheduled('chargeguard_cleanup_stale_drafts')) {
+        wp_schedule_event(time(), 'hourly', 'chargeguard_cleanup_stale_drafts');
+    }
+    if (!wp_next_scheduled('chargeguard_cleanup_atomic_rate_limit_buckets')) {
+        wp_schedule_event(time(), 'hourly', 'chargeguard_cleanup_atomic_rate_limit_buckets');
+    }
+}
+
 add_action('init', 'chargeguard_init_updater');
 function chargeguard_init_updater() {
     if (is_admin()) {

@@ -310,6 +310,12 @@ class ChargeGuard_Dynamic_Firewall {
         // optional rather than being conditionally shown (see
         // register_otp_checkout_field() below for the full rationale).
         add_action('woocommerce_init', [$this, 'register_otp_checkout_field']);
+
+        // 7b. [P1-01 fix] Classic checkout equivalent of the Blocks
+        // Additional Checkout Field above. woocommerce_register_additional_checkout_field()
+        // is Blocks/Store-API-only, so Classic needs its own registration
+        // mechanism via the standard woocommerce_after_order_notes hook.
+        add_action('woocommerce_after_order_notes', [$this, 'render_classic_otp_field']);
     }
 
     /**
@@ -356,6 +362,28 @@ class ChargeGuard_Dynamic_Firewall {
                 return !empty($field_value) ? '[submitted]' : '';
             },
         ]);
+    }
+
+    /**
+     * [P1-01 fix] Classic checkout equivalent of register_otp_checkout_field().
+     * Renders a plain text field near the order-notes area (mirroring the
+     * Blocks field's 'order' location) using the standard WooCommerce
+     * checkout-field template function, since Classic checkout has no
+     * Additional Checkout Fields API. Always optional, same rationale as
+     * the Blocks field: no reliable way to conditionally show/hide it
+     * based on a risk decision that does not exist yet when the checkout
+     * form itself is rendered.
+     */
+    public function render_classic_otp_field() {
+        if (!function_exists('woocommerce_form_field')) {
+            return;
+        }
+        woocommerce_form_field('chargeguard_otp', [
+            'type'     => 'text',
+            'label'    => __('Verification code (only if you received one by email)', 'chargeguard-woocommerce'),
+            'required' => false,
+            'class'    => ['form-row-wide'],
+        ], isset($_POST['chargeguard_otp']) ? sanitize_text_field(wp_unslash($_POST['chargeguard_otp'])) : '');
     }
 
     // ─────────────────────────────────────────────
@@ -1120,6 +1148,11 @@ class ChargeGuard_Dynamic_Firewall {
 
         $this->maybe_log_malformed_fingerprint($fingerprint);
 
+        // Bound the shape before the value is used as an array key or sent to the API (it is client-controlled).
+        if (!preg_match('/^fp[12]_[0-9a-f]{1,64}$/', $fingerprint)) {
+            wp_send_json_success(['blocked' => false]);
+        }
+
         $blocked = false;
 
         // فحص محلي — مطابقة للمفتاح (بصمة الجهاز) مع التحقق من صلاحية الحظر،
@@ -1551,6 +1584,18 @@ class ChargeGuard_Dynamic_Firewall {
                     ? $challenge_request->get_error_message()
                     : 'emailSent_empty';
 
+                // A 429 from the backend's challenge gates is a deliberate 'slow down' answer, not a delivery failure - never fail open on it.
+                if (is_wp_error($challenge_request) && $challenge_request->get_error_code() === 'chargeguard_challenge_rate_limited') {
+                    if (class_exists('\Automattic\WooCommerce\StoreApi\Exceptions\RouteException')) {
+                        throw new \Automattic\WooCommerce\StoreApi\Exceptions\RouteException(
+                            'chargeguard_challenge_rate_limited',
+                            __('Too many verification requests. Please wait a few minutes and try again.', 'chargeguard-woocommerce'),
+                            429
+                        );
+                    }
+                    throw new \Exception(__('Too many verification requests. Please wait a few minutes and try again.', 'chargeguard-woocommerce'));
+                }
+
                 if ($this->is_device_blacklisted_fp($device_fp)) {
                     $this->notify_admin_challenge_delivery_failed($device_fp, $order->get_id(), $failure_reason . '_blacklisted');
                     if (class_exists('\Automattic\WooCommerce\StoreApi\Exceptions\RouteException')) {
@@ -1563,15 +1608,26 @@ class ChargeGuard_Dynamic_Firewall {
                     throw new \Exception(__('Sorry, your order cannot be processed.', 'chargeguard-woocommerce'));
                 }
 
-                $rl_key        = 'challenge_delivery_failed:' . $device_fp;
+                // Hash the client-supplied fp so the wp_options key has a bounded safe length,
+                // and use a prefix that cleanup_stale_buckets() sweeps (cg_cdf_).
+                $rl_key        = 'cg_cdf_' . md5( $device_fp );
                 $attempt_count = ChargeGuard_Atomic_Rate_Limiter::increment(
                     $rl_key,
                     self::CHALLENGE_DELIVERY_FAILED_RATE_LIMIT_WINDOW
                 );
 
-                if ($attempt_count === 0) {
+                // increment() returns PHP_INT_MAX on DB failure, >= 1 on success; 0 is never returned.
+                if ($attempt_count === PHP_INT_MAX) {
                     $this->notify_admin_challenge_delivery_failed($device_fp, $order->get_id(), $failure_reason . '_rate_limiter_unavailable');
-                    error_log('chargeguard: rate limiter unavailable during challenge-delivery-failed path for order #' . $order->get_id() . ' — proceeding with blacklist-only protection');
+                    error_log('chargeguard: rate limiter unavailable during challenge-delivery-failed path for order #' . $order->get_id() . ' — failing closed (order blocked), per ChargeGuard_Atomic_Rate_Limiter contract');
+                    if (class_exists('\Automattic\WooCommerce\StoreApi\Exceptions\RouteException')) {
+                        throw new \Automattic\WooCommerce\StoreApi\Exceptions\RouteException(
+                            'chargeguard_order_blocked',
+                            __('Sorry, your order cannot be processed.', 'chargeguard-woocommerce'),
+                            400
+                        );
+                    }
+                    throw new \Exception(__('Sorry, your order cannot be processed.', 'chargeguard-woocommerce'));
                 } elseif ($attempt_count > self::CHALLENGE_DELIVERY_FAILED_RATE_LIMIT_MAX) {
                     $this->notify_admin_challenge_delivery_failed($device_fp, $order->get_id(), $failure_reason . '_rate_limit_exceeded');
                     if (class_exists('\Automattic\WooCommerce\StoreApi\Exceptions\RouteException')) {
@@ -1643,6 +1699,49 @@ class ChargeGuard_Dynamic_Firewall {
         $billing_country = isset($_POST['billing_country']) ? sanitize_text_field(wp_unslash($_POST['billing_country'])) : '';
         $shipping_country = isset($_POST['shipping_country']) ? sanitize_text_field(wp_unslash($_POST['shipping_country'])) : '';
 
+        // [P1-01 fix] graduated otp challenge - verification portion (classic).
+        // Mirrors intercept_checkout_block()'s verification portion. Reads the
+        // raw field value directly from $_POST (classic checkout's own submission
+        // mechanism) rather than order meta, since there is no order object yet
+        // at this hook (see the pre_order_id comment below).
+        $otp_submitted = isset($_POST['chargeguard_otp']) ? sanitize_text_field(wp_unslash($_POST['chargeguard_otp'])) : '';
+
+        // httponly - same cookie-trust model as chargeguard_dt. proof this
+        // (device, email) pair already passed a challenge within 24h.
+        $challenge_ticket = isset($_COOKIE['chargeguard_ct']) ? sanitize_text_field(wp_unslash($_COOKIE['chargeguard_ct'])) : '';
+
+        if ($otp_submitted !== '' && !empty($device_fp) && !empty($email) && $this->api_client) {
+            $verify_result = $this->api_client->verify_challenge($otp_submitted, $device_fp, $email);
+
+            if (is_wp_error($verify_result)) {
+                // fail open - same philosophy as intercept_checkout_block(): a
+                // connectivity problem is not the customer's fault. the code is
+                // dropped; evaluate_risk() below runs fresh and may re-request a
+                // challenge if still needed.
+                error_log('chargeguard: /challenge/verify unreachable (classic) - proceeding without a ticket: ' . $verify_result->get_error_message());
+            } elseif (!empty($verify_result['verified']) && !empty($verify_result['ticket'])) {
+                $challenge_ticket = $verify_result['ticket'];
+                setcookie('chargeguard_ct', $challenge_ticket, [
+                    'expires'  => time() + DAY_IN_SECONDS,
+                    'path'     => '/',
+                    'secure'   => is_ssl(),
+                    'httponly' => true,
+                    'samesite' => 'lax',
+                ]);
+                $_COOKIE['chargeguard_ct'] = $challenge_ticket;
+            } else {
+                // a definitive answer came back - the code was actually checked
+                // and is wrong/expired/rate-limited. actionable message, not a
+                // silent pass-through.
+                $message = !empty($verify_result['error'])
+                    ? sanitize_text_field($verify_result['error'])
+                    : __('The verification code you entered is incorrect or has expired. Please check your email and try again.', 'chargeguard-woocommerce');
+                wc_add_notice($message, 'error');
+                return;
+            }
+        }
+        // end otp verification portion
+
         // Classic checkout has no order object yet at this hook — WooCommerce
         // doesn't create one until woocommerce_checkout_create_order, later
         // in the same request. Track this ID on the instance so
@@ -1664,6 +1763,7 @@ class ChargeGuard_Dynamic_Firewall {
             'billingCountry'  => $billing_country,
             'shippingCountry' => $shipping_country,
             'merchantId'      => get_option('chargeguard_merchant_id', ''),
+            'challengeTicket' => $challenge_ticket !== '' ? $challenge_ticket : null,
         ];
 
         $result = $this->api_client->evaluate_risk($order_data);
@@ -1719,14 +1819,69 @@ class ChargeGuard_Dynamic_Firewall {
             $this->notify_admin_quota_exceeded('limited_scoring');
         }
 
-        // note: 'challenge' decisions are intentionally not handled on this
-        // classic-checkout path — deferred by design (see the otp-challenge
-        // design discussion: this store is blocks-only, so a classic
-        // implementation cannot be verified against real behavior here).
-        // a 'challenge' decision simply falls through unhandled below,
-        // identical to today's behavior for any decision value other than
-        // 'block' — i.e. the order proceeds normally, un-challenged.
+        // [P1-01 fix] 'challenge' decisions are now handled on classic
+        // checkout too, mirroring intercept_checkout_block()'s logic. Since
+        // classic checkout has no live async request/response round trip like
+        // Store API, a challenge is delivered as a checkout error notice asking
+        // the customer to enter the code and resubmit the form - the OTP field
+        // is rendered via render_classic_otp_field() and read via $otp_submitted
+        // above on the next submission. NOTE: no $order object exists yet at
+        // this hook (see pre_order_id comment below), so unlike the Blocks
+        // version, no order meta is written on the 'challenge requested'
+        // branch here - reconcile_pre_order_id() links pre_order_id to the
+        // real order once it is created, same as every other field in
+        // $order_data above.
+        if ($decision === 'challenge') {
+            $challenge_request = $this->api_client->request_challenge($device_fp, $email);
 
+            if (is_wp_error($challenge_request) || empty($challenge_request['emailSent'])) {
+                $failure_reason = is_wp_error($challenge_request)
+                    ? $challenge_request->get_error_message()
+                    : 'emailSent_empty';
+
+                // A 429 from the backend's challenge gates is a deliberate 'slow down' answer, not a delivery failure - never fail open on it.
+                if (is_wp_error($challenge_request) && $challenge_request->get_error_code() === 'chargeguard_challenge_rate_limited') {
+                    wc_add_notice(__('Too many verification requests. Please wait a few minutes and try again.', 'chargeguard-woocommerce'), 'error');
+                    return;
+                }
+
+                if ($this->is_device_blacklisted_fp($device_fp)) {
+                    $this->notify_admin_challenge_delivery_failed($device_fp, $this->pre_order_id, $failure_reason . '_blacklisted');
+                    $message = __('Sorry, your order cannot be processed.', 'chargeguard-woocommerce');
+                    wc_add_notice($message, 'error');
+                    return;
+                }
+
+                // Hash the client-supplied fp so the wp_options key has a bounded safe length,
+                // and use a prefix that cleanup_stale_buckets() sweeps (cg_cdf_).
+                $rl_key        = 'cg_cdf_' . md5( $device_fp );
+                $attempt_count = ChargeGuard_Atomic_Rate_Limiter::increment(
+                    $rl_key,
+                    self::CHALLENGE_DELIVERY_FAILED_RATE_LIMIT_WINDOW
+                );
+
+                // increment() returns PHP_INT_MAX on DB failure, >= 1 on success; 0 is never returned.
+                if ($attempt_count === PHP_INT_MAX) {
+                    $this->notify_admin_challenge_delivery_failed($device_fp, $this->pre_order_id, $failure_reason . '_rate_limiter_unavailable');
+                    error_log('chargeguard: rate limiter unavailable during challenge-delivery-failed path (classic) for pre_order_id ' . $this->pre_order_id . ' - failing closed (order blocked), per ChargeGuard_Atomic_Rate_Limiter contract');
+                    $message = __('Sorry, your order cannot be processed.', 'chargeguard-woocommerce');
+                    wc_add_notice($message, 'error');
+                    return;
+                } elseif ($attempt_count > self::CHALLENGE_DELIVERY_FAILED_RATE_LIMIT_MAX) {
+                    $this->notify_admin_challenge_delivery_failed($device_fp, $this->pre_order_id, $failure_reason . '_rate_limit_exceeded');
+                    $message = __('Sorry, your order cannot be processed.', 'chargeguard-woocommerce');
+                    wc_add_notice($message, 'error');
+                    return;
+                } else {
+                    $this->notify_admin_challenge_delivery_failed($device_fp, $this->pre_order_id, $failure_reason);
+                    error_log('chargeguard: challenge requested but email delivery unconfirmed (classic) - proceeding under rate limit (' . $attempt_count . '/' . self::CHALLENGE_DELIVERY_FAILED_RATE_LIMIT_MAX . ') for pre_order_id ' . $this->pre_order_id);
+                }
+            } else {
+                $message = __('For your security, we sent a verification code to your email. Please enter it in the "Verification code" field below and place your order again.', 'chargeguard-woocommerce');
+                wc_add_notice($message, 'error');
+                return;
+            }
+        }
         // حظر الطلب إذا كان القرار "block" لأسباب فعلية غير الكوتا
         if ($decision === 'block') {
             // Activate the local firewall: a confirmed block decision from

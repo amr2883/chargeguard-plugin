@@ -95,8 +95,13 @@ trait ChargeGuard_Auto_Block_Trait {
                 $reason = __( 'Blocked by ChargeGuard: fraud decision received.', 'chargeguard-woocommerce' );
             }
 
-            $order->update_status( 'failed', $reason );
-            $order->add_order_note( 'ChargeGuard decision: block. Flags: ' . json_encode( $result['flags'] ?? [] ) );
+                        // Guard against flipping a terminal order. A webhook can arrive
+                        // days late - forcing completed/refunded to 'failed' would
+                        // mislead the merchant and may misfire stock restores.
+                        if ( in_array( $order->get_status(), [ 'pending', 'on-hold', 'processing' ], true ) ) {
+                            $order->update_status( 'failed', $reason );
+                        }
+                        $order->add_order_note( 'ChargeGuard decision: block. Flags: ' . json_encode( $result['flags'] ?? [] ) );
         }
 
         // ── Auto-Refund (opt-in, separate from Auto-Block) ────────────────

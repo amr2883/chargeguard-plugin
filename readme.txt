@@ -3,7 +3,7 @@ Contributors: Amr453
 Tags: card testing, fraud prevention, woocommerce security, chargeback protection, bot detection
 Requires at least: 6.0
 Tested up to: 6.5
-Stable tag: 1.0.30
+Stable tag: 1.0.31
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -69,10 +69,22 @@ The risk analysis is performed by the ChargeGuard cloud API. Only non-sensitive 
 
 == Changelog ==
 
+= 1.0.31 =
+* Security: Restore fail-closed behavior when rate limiter DB is unavailable (regression in 1.0.30 batch-2, now fixed)
+* Security: Admin JS — escHtml now escapes single quotes; cgGetEffectivePenalty coerces basePenalty to Number
+* Fix: Self-healing cron scheduler (chargeguard_ensure_scheduled_events) recovers lost events on init
+* Fix: HPOS order status guard; ARL cleanup LIMIT+ORDER; admin-only updates endpoint
+* Fix: PayPal direct link parsing; email normalization on registration
+* Fix: Stripe auth guard on challenge; challenge 429 shape; fp shape
+* Fix: Dashboard Prisma singleton + BOM strip; CSV injection + numeric guard; JSON 404 handler
+
 = 1.0.0 =
 * Initial release with multi-layer fraud prevention.
 
 == Upgrade Notice ==
+
+= 1.0.31 =
+Security fix included: rate limiter fail-closed behavior restored. Upgrade strongly recommended for all active stores.
 
 = 1.0.0 =
 Initial release.
@@ -82,9 +94,9 @@ Initial release.
 This plugin connects to the ChargeGuard API, an external service provided by the ChargeGuard team, to perform real-time fraud risk assessment. During checkout, the following non-personal order data is transmitted for analysis:
 
 * Customer IP address
-* Customer email address (hashed)
+* Customer email address (sent to the ChargeGuard API over HTTPS for reputation checks and, when needed, to deliver a verification code)
 * Order total
-* A unique, randomly generated device fingerprint
+* A device fingerprint derived from browser and hardware characteristics (user agent, screen, time zone, canvas/WebGL renderer)
 
 This data is used exclusively for fraud prevention and is not shared with any third party. The data is subject to the ChargeGuard Terms of Service and Privacy Policy.
 

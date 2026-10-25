@@ -1623,6 +1623,20 @@ class ChargeGuard_Admin_Settings {
             wp_send_json_error( [ 'message' => 'That does not look like a valid Stripe secret key. It should start with sk_test_, sk_live_, rk_test_, or rk_live_.' ] );
         }
 
+        if ( ! empty( $webhook_secret ) && ! preg_match( '/^whsec_[A-Za-z0-9]+$/', $webhook_secret ) ) {
+            wp_send_json_error( [ 'message' => 'That does not look like a valid Stripe webhook signing secret. It should start with whsec_.' ] );
+        }
+
+        // Enabling requires BOTH secrets (newly submitted now, or already stored) - an enabled
+        // integration with an empty signing secret would accept forged webhooks.
+        if ( $enabled === '1' ) {
+            $have_secret_key     = ! empty( $secret_key )     || (string) chargeguard_get_secret_option( 'chargeguard_stripe_secret_key' ) !== '';
+            $have_webhook_secret = ! empty( $webhook_secret ) || (string) chargeguard_get_secret_option( 'chargeguard_stripe_webhook_secret' ) !== '';
+            if ( ! $have_secret_key || ! $have_webhook_secret ) {
+                wp_send_json_error( [ 'message' => 'Stripe cannot be enabled until both the secret key and the webhook signing secret are saved.' ] );
+            }
+        }
+
         if ( ! empty( $secret_key ) ) {
             chargeguard_update_secret_option( 'chargeguard_stripe_secret_key', $secret_key );
         }

@@ -570,30 +570,35 @@ class ChargeGuard_PayPal_Webhook {
         $custom_id = $resource['purchase_units'][0]['custom_id']
                   ?? $resource['custom_id']
                   ?? null;
-        if ( $custom_id && is_numeric( $custom_id ) ) {
-            $order = wc_get_order( (int) $custom_id );
-            if ( $order ) {
-                return $order->get_id();
-            }
-        }
+                if ( $custom_id && is_numeric( $custom_id ) ) {
+                    $order = wc_get_order( (int) $custom_id );
+                    // Confirm payment method is PayPal before trusting this reference.
+                    // Prevents acting on a different customer's order when sequential
+                    // order-number plugins reuse IDs across payment gateways.
+                    if ( $order && strpos( (string) $order->get_payment_method(), 'paypal' ) !== false ) {
+                        return $order->get_id();
+                    }
+                }
 
-        // المسار 2: invoice_id
-        $invoice_id = $resource['purchase_units'][0]['invoice_id'] ?? null;
-        if ( $invoice_id && is_numeric( $invoice_id ) ) {
-            $order = wc_get_order( (int) $invoice_id );
-            if ( $order ) {
-                return $order->get_id();
-            }
-        }
+                // المسار 2: invoice_id
+                $invoice_id = $resource['purchase_units'][0]['invoice_id'] ?? null;
+                if ( $invoice_id && is_numeric( $invoice_id ) ) {
+                    $order = wc_get_order( (int) $invoice_id );
+                    if ( $order && strpos( (string) $order->get_payment_method(), 'paypal' ) !== false ) {
+                        return $order->get_id();
+                    }
+                }
 
-        // المسار 3: البحث بـ PayPal transaction ID في meta
-        if ( ! empty( $extracted['txn_id'] ) ) {
-            $orders = wc_get_orders( [
-                'limit'      => 1,
-                'meta_key'   => '_transaction_id',
-                'meta_value' => $extracted['txn_id'],
-                'return'     => 'ids',
-            ] );
+                // المسار 3: البحث بـ PayPal transaction ID
+                // Uses WooCommerce's native 'transaction_id' query arg (works on both
+                // legacy postmeta and HPOS wc_orders table) - raw meta_key only
+                // resolves against postmeta on HPOS stores.
+                if ( ! empty( $extracted['txn_id'] ) ) {
+                    $orders = wc_get_orders( [
+                        'limit'          => 1,
+                        'transaction_id' => $extracted['txn_id'],
+                        'return'         => 'ids',
+                    ] );
             if ( ! empty( $orders ) ) {
                 return $orders[0];
             }
@@ -657,13 +662,13 @@ class ChargeGuard_PayPal_Webhook {
             return true;
         }
 
-        // البحث عن الطلب المرتبط بهذه المعاملة
-        $orders = wc_get_orders( [
-            'limit'      => 1,
-            'meta_key'   => '_transaction_id',
-            'meta_value' => $txn_id,
-            'return'     => 'ids',
-        ] );
+                // البحث عن الطلب المرتبط بهذه المعاملة
+                // 'transaction_id' works on both legacy postmeta and HPOS.
+                $orders = wc_get_orders( [
+                    'limit'          => 1,
+                    'transaction_id' => $txn_id,
+                    'return'         => 'ids',
+                ] );
 
         if ( empty( $orders ) ) {
             // Deterministic — a redelivery carries the same txn_id and

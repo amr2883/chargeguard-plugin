@@ -53,7 +53,9 @@ class ChargeGuard_Stripe_Webhook {
         }
 
         $stripe_init = __DIR__ . '/../vendor/stripe/stripe-php/init.php';
-        if (file_exists($stripe_init)) {
+        if (class_exists('\Stripe\Stripe')) {
+            // SDK already loaded (e.g. by another plugin on this store) - reuse it instead of re-declaring its classes.
+        } elseif (file_exists($stripe_init)) {
             require_once $stripe_init;
         } else {
             error_log('[ChargeGuard] Stripe webhook received but vendor/stripe/stripe-php/init.php is missing — run composer install.');
@@ -74,6 +76,16 @@ class ChargeGuard_Stripe_Webhook {
         $payload   = $request->get_body();
         $sig_header = $request->get_header('stripe_signature');
         $endpoint_secret = chargeguard_get_secret_option('chargeguard_stripe_webhook_secret');
+
+        // Fail closed: an HMAC check with an empty key is meaningless (an attacker can compute a valid signature),
+        // so never reach constructEvent() without a real signing secret and a signature header.
+        if (!is_string($endpoint_secret) || $endpoint_secret === '') {
+            error_log('[ChargeGuard] Stripe webhook rejected: no webhook signing secret is configured (or it could not be decrypted).');
+            return new \WP_REST_Response(['error' => 'Unable to process webhook'], 500);
+        }
+        if (!is_string($sig_header) || $sig_header === '') {
+            return new \WP_REST_Response(['error' => 'Invalid signature'], 403);
+        }
 
         // التحقق من توقيع Stripe
         try {
@@ -142,7 +154,7 @@ class ChargeGuard_Stripe_Webhook {
             // the same payment intent with no charges every time, so mark
             // processed to stop Stripe retrying a call that cannot succeed.
             set_transient($cache_key, 1, 48 * HOUR_IN_SECONDS);
-            return new \WP_REST_Response(['error' => 'No charges found'], 400);
+            return new \WP_REST_Response(['status' => 'ignored', 'reason' => 'no_charges'], 200);
         }
 
         $card = $charge->payment_method_details->card ?? null;
@@ -151,7 +163,7 @@ class ChargeGuard_Stripe_Webhook {
             // Deterministic — the charge will never gain card details on
             // retry, so mark processed to stop further redelivery attempts.
             set_transient($cache_key, 1, 48 * HOUR_IN_SECONDS);
-            return new \WP_REST_Response(['error' => 'No card details found'], 400);
+            return new \WP_REST_Response(['status' => 'ignored', 'reason' => 'no_card_details'], 200);
         }
 
         $iin     = $card->iin ?? null;
@@ -181,7 +193,7 @@ class ChargeGuard_Stripe_Webhook {
         if (!$iin) {
             // Deterministic — the same card data will lack an IIN on retry too.
             set_transient($cache_key, 1, 48 * HOUR_IN_SECONDS);
-            return new \WP_REST_Response(['error' => 'No IIN found'], 400);
+            return new \WP_REST_Response(['status' => 'ignored', 'reason' => 'no_iin'], 200);
         }
 
         // البحث عن الطلب المرتبط بـ payment_intent_id
@@ -536,13 +548,13 @@ class ChargeGuard_Stripe_Webhook {
             ? $dispute->charge
             : ($dispute->charge->id ?? null);
 
-        if ($charge_id) {
-            $orders = wc_get_orders([
-                'limit'      => 1,
-                'meta_key'   => '_transaction_id',
-                'meta_value' => $charge_id,
-                'return'     => 'ids',
-            ]);
+                if ($charge_id) {
+                    // 'transaction_id' works on both legacy postmeta and HPOS.
+                    $orders = wc_get_orders([
+                        'limit'          => 1,
+                        'transaction_id' => $charge_id,
+                        'return'         => 'ids',
+                    ]);
             if (!empty($orders)) {
                 return $orders[0];
             }

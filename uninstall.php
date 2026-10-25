@@ -62,8 +62,13 @@ $chargeguard_options = [
     'chargeguard_stripe_enabled',
     'chargeguard_auto_block',
     'chargeguard_block_min_amount',
-    'chargeguard_deactivated_notice',
-];
+        'chargeguard_deactivated_notice',
+        'chargeguard_challenge_delivery_failed_notice',
+        'chargeguard_auto_refund',
+        'chargeguard_api_down_behavior',
+        'chargeguard_api_down_allow_all_ack',
+        'chargeguard_api_down_rate_limit',
+    ];
 
 foreach ( $chargeguard_options as $option_name ) {
     delete_option( $option_name );
@@ -120,13 +125,31 @@ foreach ( $chargeguard_transient_prefixes as $prefix ) {
 wp_cache_flush();
 
 /**
+ * 5b. Delete ChargeGuard_Atomic_Rate_Limiter rows from wp_options.
+ *     These are raw option rows (NOT transients) written by increment().
+ *     Two prefixes - keep in sync with cleanup_stale_buckets():
+ *       cg_apidown_ip_ - API-down IP velocity counters
+ *       cg_cdf_        - challenge-delivery-failed counters (1.0.31+)
+ */
+foreach ( [ 'cg_apidown_ip_', 'cg_cdf_' ] as $chargeguard_arl_prefix ) {
+    $wpdb->query(
+        $wpdb->prepare(
+            "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s",
+            $wpdb->esc_like( $chargeguard_arl_prefix ) . '%'
+        )
+    );
+}
+
+/**
  * 5. Delete order meta added by ChargeGuard. Scoped to postmeta rows on
  *    'shop_order' posts (and HPOS order tables, if WooCommerce's
  *    High-Performance Order Storage is enabled) to avoid touching
  *    unrelated meta.
  */
 $chargeguard_order_meta_keys = [
-    '_chargeguard_device_fingerprint',
+    '_chargeguard_device_fingerprint',  // legacy key (pre-1.0.31; kept for transitional stores)
+    '_chargeguard_device_fp',           // canonical key (1.0.31+, both checkout flows)
+    '_chargeguard_device_token',        // server-signed device token
     '_chargeguard_payment_intent_id',
     '_chargeguard_pre_order_id',
 ];

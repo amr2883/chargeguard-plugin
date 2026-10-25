@@ -153,13 +153,29 @@ class ChargeGuard_Atomic_Rate_Limiter {
             return PHP_INT_MAX;
         }
 
-        $count = (int) $wpdb->insert_id;
+        // [P0-09 fix] $wpdb->insert_id is unreliable here: when a table has
+        // its own AUTO_INCREMENT primary key (option_id), MySQL/MariaDB
+        // returns THAT auto-increment value instead of the LAST_INSERT_ID(expr)
+        // value — but only on the fresh-INSERT branch specifically, not on
+        // the ON DUPLICATE KEY UPDATE branch. Confirmed via direct testing:
+        // a brand-new key's first increment() call returned wp_options'
+        // current option_id (e.g. 8790) instead of 1, while every
+        // subsequent call on the same key (UPDATE branch) returned the
+        // correct sequential count (2, 3, ...). The atomic write above has
+        // already committed the correct value into option_value regardless
+        // — this follow-up read is not a new race window, it simply
+        // reports back what was atomically written, instead of trusting
+        // insert_id.
+        $count = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s",
+            $option_name
+        ));
         if ($count <= 0) {
-            // Should not happen given the query always assigns a positive
-            // value via LAST_INSERT_ID(), but guard against a driver/proxy
-            // layer that doesn't propagate insert_id correctly rather than
-            // silently returning a bogus count to the caller.
-            error_log('ChargeGuard_Atomic_Rate_Limiter::increment() got an unexpected non-positive insert_id — failing closed (treating as over limit).');
+            // Should not happen given the value written is always a positive
+            // integer via LAST_INSERT_ID(), but guard against a replication-lag
+            // read replica or any other layer returning a bogus count rather
+            // than silently trusting it.
+            error_log('ChargeGuard_Atomic_Rate_Limiter::increment() got an unexpected non-positive count on read-back — failing closed (treating as over limit).');
             return PHP_INT_MAX;
         }
 
@@ -204,15 +220,26 @@ class ChargeGuard_Atomic_Rate_Limiter {
     public static function cleanup_stale_buckets() {
         global $wpdb;
 
-        $prefix = $wpdb->esc_like(ChargeGuard_Dynamic_Firewall::API_DOWN_RATE_LIMIT_TRANSIENT_PREFIX) . '%';
+                // All option-name prefixes this method sweeps.
+                // Add a new entry whenever a new caller of increment() introduces a new prefix.
+                $prefixes = [
+                    ChargeGuard_Dynamic_Firewall::API_DOWN_RATE_LIMIT_TRANSIENT_PREFIX,
+                    'cg_cdf_', // challenge-delivery-failed counters (added 1.0.31)
+                ];
 
-        $option_names = $wpdb->get_col(
-            $wpdb->prepare(
-                "SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s LIMIT %d",
-                $prefix,
-                self::CLEANUP_BATCH_SIZE
-            )
-        );
+                $option_names = [];
+                foreach ( $prefixes as $_arl_prefix ) {
+                    $rows = $wpdb->get_col(
+                        $wpdb->prepare(
+                            "SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s LIMIT %d",
+                            $wpdb->esc_like( $_arl_prefix ) . '%',
+                            self::CLEANUP_BATCH_SIZE
+                        )
+                    );
+                    if ( ! empty( $rows ) ) {
+                        $option_names = array_merge( $option_names, $rows );
+                    }
+                }
 
         if (empty($option_names)) {
             return;

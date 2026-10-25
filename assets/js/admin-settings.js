@@ -8,7 +8,7 @@
     function escHtml(str) {
         return String(str)
             .replace(/&/g,'&amp;').replace(/</g,'&lt;')
-            .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+            .replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
     }
 
     // ── Helper: Render Table ─────────────────────────────────
@@ -707,6 +707,7 @@
     let cgPendingChange   = null;
 
     function cgGetEffectivePenalty(basePenalty, override) {
+        basePenalty = Number(basePenalty) || 0;
         if (override === 'allow')    return 0;
         if (override === 'escalate') return Math.min(basePenalty * 2, 20);
         return basePenalty;
@@ -719,7 +720,7 @@
         const oldPenalty = cgGetEffectivePenalty(c.basePenalty, change.currentOverride);
 
         if (change.newOverride === 'allow') {
-            return tierConf.emoji + ' Removing the +' + c.basePenalty +
+            return tierConf.emoji + ' Removing the +' + Number(c.basePenalty) +
                 ' pt risk penalty for <strong>' + escHtml(c.name) + '</strong>. ' +
                 'All other fraud signals still apply.' +
                 (c.tier === 'critical' ? ' <strong style="color:#dc2626;">⚠️ High-risk region — monitor chargebacks closely.</strong>' : '');
@@ -730,7 +731,7 @@
                 'Transactions from this region will be scored more strictly.';
         }
         return '↩️ Restoring <strong>' + escHtml(c.name) +
-            '</strong> to Smart default (' + c.basePenalty + ' pts).';
+            '</strong> to Smart default (' + Number(c.basePenalty) + ' pts).';
     }
 
     function cgRenderTierGroups(countries) {
